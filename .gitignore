@@ -1,0 +1,4 @@
+/target
+# The engine DLL is downloaded from the GitHub release at build time
+# (see build.rs); never commit a vendored copy.
+/vendor

@@ -1,0 +1,35 @@
+[package]
+name = "seraph-memory-rs"
+description = "Global MCP memory server over the SERAPH C FFI (candle backend)."
+version = "0.1.0"
+edition = "2021"
+authors = ["Tree D Interactive LLC"]
+license = "MIT"
+repository = "https://github.com/Tree-D-Interactive-LLC/seraph-memory-mcp"
+readme = "README.md"
+
+[[bin]]
+name = "seraph-memory-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Canonical safe Rust surface over the SERAPH cdylib. Depending on this crate
+# (instead of hand-transcribing the C ABI) keeps the binding surface from
+# drifting out of sync with the engine. Published as source in the seraph repo's
+# git tree; the committed Cargo.lock pins an exact rev for reproducible builds.
+# Once a release tag includes the wrapper, switch `branch = "main"` -> `tag = "v<ver>"`.
+# For local iteration against the working copy, use a gitignored
+# .cargo/config.toml `paths` override instead of editing this line.
+seraph = { git = "https://github.com/Tree-D-Interactive-LLC/seraph", branch = "main" }
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-async-rw"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+
+[profile.release]
+opt-level = 2
