@@ -2,3 +2,5 @@
 # The engine DLL is downloaded from the GitHub release at build time
 # (see build.rs); never commit a vendored copy.
 /vendor
+# Publish tooling (present only in the standalone publish repo) — never published.
+/publish.sh

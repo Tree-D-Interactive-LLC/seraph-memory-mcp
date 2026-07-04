@@ -16,11 +16,10 @@ path = "src/main.rs"
 # Canonical safe Rust surface over the SERAPH cdylib. Depending on this crate
 # (instead of hand-transcribing the C ABI) keeps the binding surface from
 # drifting out of sync with the engine. Published as source in the seraph repo's
-# git tree; the committed Cargo.lock pins an exact rev for reproducible builds.
-# Once a release tag includes the wrapper, switch `branch = "main"` -> `tag = "v<ver>"`.
-# For local iteration against the working copy, use a gitignored
-# .cargo/config.toml `paths` override instead of editing this line.
-seraph = { git = "https://github.com/Tree-D-Interactive-LLC/seraph", branch = "main" }
+# git tree; pinned to a release tag so builds are reproducible. Bump the tag when
+# adopting a new engine release. For local iteration against the working copy, use
+# a gitignored .cargo/config.toml `paths` override instead of editing this line.
+seraph = { git = "https://github.com/Tree-D-Interactive-LLC/seraph", tag = "v0.2.5" }
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-async-rw"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "time"] }
 serde = { version = "1", features = ["derive"] }
