@@ -27,6 +27,88 @@ use store::{resolve_mag, Engine};
 const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 // --------------------------------------------------------------------------- //
+// time and order parsing — the application-layer half of temporal recall
+// --------------------------------------------------------------------------- //
+
+/// Parse a caller-supplied time expression into microseconds since the Unix
+/// epoch, which is what the engine's temporal window takes.
+///
+/// Accepted forms, in the order they are tried:
+/// - relative age — `30m`, `24h`, `7d`, `2w`: that long *before now*
+/// - raw epoch microseconds — a bare integer, for programmatic callers
+/// - RFC 3339 timestamp — `2026-07-01T14:30:00Z`
+/// - plain date — `2026-07-01`, read as midnight UTC
+fn parse_time_us(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty time value".into());
+    }
+
+    // Relative age: digits followed by a unit suffix. Parsed unsigned, so a
+    // negative span is rejected rather than resolving into the future.
+    if let Some(split) = t.find(|c: char| c.is_ascii_alphabetic()) {
+        if split > 0 {
+            if let Ok(n) = t[..split].parse::<u64>() {
+                let unit = t[split..].to_ascii_lowercase();
+                let secs: u64 = match unit.as_str() {
+                    "s" | "sec" | "secs" | "second" | "seconds" => 1,
+                    "m" | "min" | "mins" | "minute" | "minutes" => 60,
+                    "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+                    "d" | "day" | "days" => 86_400,
+                    "w" | "wk" | "wks" | "week" | "weeks" => 604_800,
+                    other => {
+                        return Err(format!(
+                            "unknown time unit '{other}' — use s, m, h, d, or w"
+                        ))
+                    }
+                };
+                let total = n.saturating_mul(secs).min(i64::MAX as u64) as i64;
+                let delta = chrono::Duration::try_seconds(total)
+                    .ok_or_else(|| format!("time span '{t}' is out of range"))?;
+                let then = chrono::Utc::now() - delta;
+                return Ok(then.timestamp_micros().max(0) as u64);
+            }
+        }
+    }
+
+    // Raw epoch microseconds.
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        return t
+            .parse::<u64>()
+            .map_err(|_| format!("'{t}' is not a valid epoch-microsecond value"));
+    }
+
+    // Absolute timestamps.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Ok(dt.timestamp_micros().max(0) as u64);
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d") {
+        if let Some(dt) = date.and_hms_opt(0, 0, 0) {
+            return Ok(dt.and_utc().timestamp_micros().max(0) as u64);
+        }
+    }
+
+    Err(format!(
+        "unrecognized time '{t}' — use a relative age (7d), a date (2026-07-01), \
+         an RFC 3339 timestamp, or epoch microseconds"
+    ))
+}
+
+/// Parse the caller's `order` string into the engine's presentation order.
+fn parse_order(s: Option<&str>) -> Result<seraph::TemporalOrder, String> {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("relevance") | Some("score") => Ok(seraph::TemporalOrder::Relevance),
+        Some("most_recent") | Some("recent") | Some("newest") => {
+            Ok(seraph::TemporalOrder::MostRecent)
+        }
+        Some("oldest") | Some("earliest") => Ok(seraph::TemporalOrder::Oldest),
+        Some(other) => Err(format!(
+            "unknown order '{other}' — use relevance, most_recent, or oldest"
+        )),
+    }
+}
+
+// --------------------------------------------------------------------------- //
 // request shapes
 // --------------------------------------------------------------------------- //
 
@@ -67,6 +149,20 @@ pub struct RecallReq {
     #[schemars(description = "Include soft-forgotten (superseded) frames in results (default false). \
         Off keeps recall clean; on is for audit — retrieving what was superseded.")]
     pub include_superseded: Option<bool>,
+    #[schemars(description = "Order of the returned hits: \"relevance\" (default, by meaning), \
+        \"most_recent\" (newest first), or \"oldest\". This sorts the SAME relevant hits by write \
+        time — it does not search for newer material, so a recent frame that was not relevant \
+        enough to make top_k will not appear. Raise top_k for more time depth, or use `after` to \
+        scope the search to a window.")]
+    pub order: Option<String>,
+    #[schemars(description = "Only return frames written at or after this time. Accepts a \
+        relative age (\"30m\", \"24h\", \"7d\", \"2w\" — that long ago), a date (\"2026-07-01\", \
+        UTC midnight), an RFC 3339 timestamp, or raw epoch microseconds. Use this for \
+        \"what changed since ...\" questions.")]
+    pub after: Option<String>,
+    #[schemars(description = "Only return frames written at or before this time. Same formats as \
+        `after`.")]
+    pub before: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -300,12 +396,30 @@ impl SeraphMemory {
     // ---- recall ----
     #[tool(description = "Semantic recall: search memory by meaning. Returns ranked frames with \
         score, confidence, and a content snippet. Set include_superseded=true to also retrieve \
-        soft-forgotten frames (audit).")]
+        soft-forgotten frames (audit). Temporal options: order=\"most_recent\" returns the same \
+        relevant hits sorted newest-first (it reorders, it does not search further back in \
+        relevance — raise top_k for more depth); after/before scope which frames may occupy a \
+        result slot, taking a relative age (\"7d\"), a date (\"2026-07-01\"), or an RFC 3339 \
+        timestamp — use after for \"what changed since ...\". When either is set, each hit also \
+        carries its RFC 3339 timestamp.")]
     async fn recall(&self, Parameters(r): Parameters<RecallReq>) -> Result<CallToolResult, McpError> {
         let top_k = r.top_k.unwrap_or(10) as usize;
         let tau = r.tau.unwrap_or(0.5);
         let include_superseded = r.include_superseded.unwrap_or(false);
-        self.run(move |e| e.recall(&r.query, top_k, tau, include_superseded)).await
+        let order = parse_order(r.order.as_deref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let after_us = match r.after.as_deref() {
+            Some(s) => Some(parse_time_us(s).map_err(|e| McpError::invalid_params(e, None))?),
+            None => None,
+        };
+        let before_us = match r.before.as_deref() {
+            Some(s) => Some(parse_time_us(s).map_err(|e| McpError::invalid_params(e, None))?),
+            None => None,
+        };
+        self.run(move |e| {
+            e.recall(&r.query, top_k, tau, include_superseded, order, after_us, before_us)
+        })
+        .await
     }
 
     #[tool(description = "Soft-forget a frame: mark it superseded so it stops surfacing in recall \
@@ -806,5 +920,67 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(windows))]
     {
         run_inprocess(&path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_order, parse_time_us};
+    use seraph::TemporalOrder;
+
+    fn now_us() -> u64 {
+        chrono::Utc::now().timestamp_micros() as u64
+    }
+
+    #[test]
+    fn relative_ages_resolve_into_the_past() {
+        let now = now_us();
+        for (expr, secs) in [("90s", 90u64), ("30m", 1_800), ("24h", 86_400), ("7d", 604_800), ("2w", 1_209_600)] {
+            let t = parse_time_us(expr).expect(expr);
+            let delta = now.saturating_sub(t);
+            let expected = secs * 1_000_000;
+            // Generous tolerance — the clock advances between the two reads.
+            assert!(
+                delta.abs_diff(expected) < 5_000_000,
+                "{expr}: expected ~{expected}us ago, got {delta}us"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_spellings_are_accepted() {
+        let a = parse_time_us("1d").unwrap();
+        for alias in ["1day", "1days", "24h", "24hours"] {
+            let b = parse_time_us(alias).unwrap();
+            assert!(a.abs_diff(b) < 5_000_000, "{alias} should match 1d");
+        }
+    }
+
+    #[test]
+    fn absolute_forms_parse_exactly() {
+        // RFC 3339, and the same instant as a plain date at UTC midnight.
+        assert_eq!(
+            parse_time_us("2026-07-01T00:00:00Z").unwrap(),
+            parse_time_us("2026-07-01").unwrap()
+        );
+        // Raw epoch microseconds pass through untouched.
+        assert_eq!(parse_time_us("1751328000000000").unwrap(), 1_751_328_000_000_000);
+    }
+
+    #[test]
+    fn malformed_time_is_rejected() {
+        for bad in ["", "   ", "yesterday", "7y", "2026-13-45", "abc", "-5d"] {
+            assert!(parse_time_us(bad).is_err(), "'{bad}' should be rejected");
+        }
+    }
+
+    #[test]
+    fn order_parses_with_aliases_and_rejects_junk() {
+        assert_eq!(parse_order(None).unwrap(), TemporalOrder::Relevance);
+        assert_eq!(parse_order(Some("relevance")).unwrap(), TemporalOrder::Relevance);
+        assert_eq!(parse_order(Some("MOST_RECENT")).unwrap(), TemporalOrder::MostRecent);
+        assert_eq!(parse_order(Some(" newest ")).unwrap(), TemporalOrder::MostRecent);
+        assert_eq!(parse_order(Some("oldest")).unwrap(), TemporalOrder::Oldest);
+        assert!(parse_order(Some("sideways")).is_err());
     }
 }

@@ -27,6 +27,29 @@ substrate tools: *remember / recall*, reasoning **chains**, three-population
 magnitudes (`routing`, `saturation`, …) — defaults assume 1024-d and are wrong on
 the 384-d default encoder. Keep `profile=bounded`.
 
+### Temporal recall
+
+`recall` is primarily a search by *meaning*, but three optional arguments let you
+scope or re-present those hits by write time — for "what changed since …" and
+"what did we conclude most recently" questions.
+
+| Argument | Effect |
+|----------|--------|
+| `after` | Only frames written at or after this time |
+| `before` | Only frames written at or before this time |
+| `order` | `relevance` (default), `most_recent`, or `oldest` |
+
+`after` / `before` accept a **relative age** (`30m`, `24h`, `7d`, `2w` — that long
+ago), a **plain date** (`2026-07-01`, read as midnight UTC), an **RFC 3339
+timestamp** (`2026-07-01T14:30:00Z`), or raw **epoch microseconds**. When either
+is set, every hit also carries its RFC 3339 timestamp.
+
+> **`order` reorders, it does not search further back.** `most_recent` sorts the
+> *same* relevant hits newest-first, so a recent frame that wasn't relevant enough
+> to make `top_k` still won't appear. For more time depth, raise `top_k` — or use
+> `after` to scope the search to a window, which frees result slots that
+> higher-scoring older frames would otherwise occupy.
+
 ## Requirements
 
 - **Windows x86_64** with the **MSVC toolchain** (`x86_64-pc-windows-msvc`). The

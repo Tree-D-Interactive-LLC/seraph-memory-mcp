@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use seraph::{Encoder, Store, StoreConfig};
+use seraph::{Encoder, Store, StoreConfig, TemporalOrder};
 
 pub struct Engine {
     // `encoder` is declared before `store` so it drops first (mirrors the old
@@ -66,6 +66,39 @@ pub fn resolve_mag(v: &Value) -> f32 {
 }
 
 /// A single search hit enriched with a content snippet.
+/// A frame's write time as an RFC 3339 string, decoded from its own id.
+///
+/// Frame ids are UUIDv7: the leading 48 bits are unix milliseconds, which is
+/// the same creation ordering the engine's recency sort follows. The time is
+/// therefore already in hand for every hit — no engine round trip needed.
+fn frame_timestamp_iso(frame_id: &str) -> Option<String> {
+    let hex: String = frame_id.chars().filter(|c| *c != '-').take(12).collect();
+    if hex.len() < 12 {
+        return None;
+    }
+    let ms = u64::from_str_radix(&hex, 16).ok()?;
+    chrono::DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.to_rfc3339())
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::frame_timestamp_iso;
+
+    #[test]
+    fn decodes_write_time_from_the_v7_id() {
+        // A real frame id from the store: leading 48 bits are unix millis.
+        let iso = frame_timestamp_iso("019f97ad-194b-7ec9-929c-73cb3177d002").unwrap();
+        assert!(iso.starts_with("2026-07-25T"), "got {iso}");
+    }
+
+    #[test]
+    fn rejects_ids_that_are_not_v7() {
+        assert!(frame_timestamp_iso("").is_none());
+        assert!(frame_timestamp_iso("not-a-uuid").is_none());
+        assert!(frame_timestamp_iso("zzzzzzzz-zzzz-7000-8000-000000000000").is_none());
+    }
+}
+
 fn hit_to_value(frame_id: String, score: f32, confidence: f32, path_length: u32, snippet: Option<String>) -> Value {
     json!({
         "frame_id": frame_id,
@@ -198,20 +231,47 @@ impl Engine {
         Some(s)
     }
 
+    /// Semantic recall, optionally scoped to a time window and re-ordered by
+    /// recency. The window gates which frames may occupy a result slot and the
+    /// order is applied after selection — neither changes what the geometry
+    /// retrieves. When a temporal option is in play each hit also carries its
+    /// timestamp, since a recency-ordered list is not readable without one.
     pub fn recall(
         &mut self,
         query: &str,
         top_k: usize,
         tau: f32,
         include_superseded: bool,
+        order: TemporalOrder,
+        after_us: Option<u64>,
+        before_us: Option<u64>,
     ) -> Result<Value> {
         let emb = self.encode(query)?;
-        let hits = self.store.search_opts(&emb, top_k, tau, include_superseded)?;
+        let temporal =
+            order != TemporalOrder::Relevance || after_us.is_some() || before_us.is_some();
+        let hits = self.store.search_temporal(
+            &emb,
+            top_k,
+            tau,
+            include_superseded,
+            order,
+            after_us,
+            before_us,
+        )?;
         let results: Vec<Value> = hits
             .into_iter()
             .map(|h| {
                 let snip = self.content_snippet(&h.frame_id);
-                hit_to_value(h.frame_id, h.score, h.confidence, h.path_length, snip)
+                let ts = if temporal {
+                    frame_timestamp_iso(&h.frame_id)
+                } else {
+                    None
+                };
+                let mut v = hit_to_value(h.frame_id, h.score, h.confidence, h.path_length, snip);
+                if let (Some(obj), Some(ts)) = (v.as_object_mut(), ts) {
+                    obj.insert("timestamp".to_string(), json!(ts));
+                }
+                v
             })
             .collect();
         Ok(json!(results))

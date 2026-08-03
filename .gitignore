@@ -1,4 +1,10 @@
 /target
+# Staging dir for rebuilding while a server process holds target/release locked;
+# the fresh binary is copied over the installed one, then this is disposable.
+/target-pending
+# Local `paths` override pointing the engine dependency at a working copy —
+# for iterating against unreleased engine surface. Never published.
+/.cargo
 # The engine DLL is downloaded from the GitHub release at build time
 # (see build.rs); never commit a vendored copy.
 /vendor
