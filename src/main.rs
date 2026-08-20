@@ -112,11 +112,26 @@ fn parse_order(s: Option<&str>) -> Result<seraph::TemporalOrder, String> {
 // request shapes
 // --------------------------------------------------------------------------- //
 
+/// Schema override for `metadata`. schemars renders a bare `Option<Value>`
+/// with NO `type` in the published schema, and at least one MCP client
+/// (Claude Code) serializes arguments for typeless properties as JSON
+/// *strings* — which the engine FFI silently parsed to an empty map. Publish
+/// a typed object so schema-driven clients send a real one, while
+/// deserialization stays lenient (`Value`): `Engine::remember` normalizes a
+/// stringified object rather than erroring on it.
+fn metadata_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "null"],
+        "additionalProperties": true,
+        "description": "Optional metadata object stored alongside the frame."
+    })
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RememberReq {
     #[schemars(description = "Text content to commit to memory.")]
     pub content: String,
-    #[schemars(description = "Optional metadata object stored alongside the frame.")]
+    #[schemars(schema_with = "metadata_schema")]
     pub metadata: Option<Value>,
 }
 

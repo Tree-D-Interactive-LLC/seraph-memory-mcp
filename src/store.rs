@@ -179,10 +179,27 @@ impl Engine {
 // write
 // --------------------------------------------------------------------------- //
 
+/// The engine FFI requires a JSON *object* string; anything else parses to an
+/// empty map with no error. Normalize the caller's value so nothing is
+/// silently lost: unwrap a JSON-object-in-a-string (clients facing a typeless
+/// schema stringify arguments), and wrap any other non-object as
+/// `{"value": ...}`.
+fn normalize_metadata(m: &Value) -> String {
+    match m {
+        Value::Object(_) => m.to_string(),
+        Value::String(s) => match serde_json::from_str::<Value>(s) {
+            Ok(v @ Value::Object(_)) => v.to_string(),
+            _ => json!({ "value": s }).to_string(),
+        },
+        Value::Null => "{}".to_string(),
+        other => json!({ "value": other }).to_string(),
+    }
+}
+
 impl Engine {
     pub fn remember(&mut self, content: &str, metadata: Option<&Value>) -> Result<Value> {
         let emb = self.encode(content)?;
-        let meta_str = metadata.map(|m| m.to_string()).unwrap_or_else(|| "{}".to_string());
+        let meta_str = metadata.map(normalize_metadata).unwrap_or_else(|| "{}".to_string());
         let fid = self.store.put_with_metadata(content.as_bytes(), &emb, &meta_str)?;
         Ok(json!({ "frame_id": fid }))
     }
