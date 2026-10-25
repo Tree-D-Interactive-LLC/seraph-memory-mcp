@@ -1,12 +1,11 @@
 //! Safe `Engine` over the canonical `seraph` crate (the idiomatic Rust wrapper
 //! around the SERAPH cdylib, `seraph-wrapper/src/lib.rs`).
 //!
-//! This module used to hand-transcribe the C ABI from `FFI_API.md`. It now
-//! depends on the `seraph` crate directly, so the binding surface can never
-//! drift from the engine again (the warp-JSON envelope bug came from exactly
-//! that drift). `Engine` owns a `seraph::Store` plus a single, lazily-created
+//! `Engine` owns a `seraph::Store` plus a single, lazily-created
 //! `seraph::Encoder`; all text is encoded through that one encoder and fed to
-//! the by-vector store API, so the model is loaded once.
+//! the by-vector store API, so the model is loaded once. Every call goes
+//! through the store's options forms (`put_with`, `put_batch`, `search_with`,
+//! `chain_with`, ...), which take everything a call can vary in one place.
 //!
 //! `Engine` is `Send` (its fields are), and access is serialized by a `Mutex`
 //! in `main`; it is intentionally not used concurrently.
@@ -14,9 +13,13 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use seraph::{Encoder, Store, StoreConfig, TemporalOrder};
+use seraph::{
+    ChainResult, DoorCause, Encoder, Endpoint, Magnitude, NeighborhoodOptions, PutItem, PutOptions,
+    Retirement, RouteOptions, SearchOptions, Store, StoreConfig, StrandOptions, Tau, TemporalOrder,
+    TimeFilter, TimeWindow, WarpInput, WarpProfile, WarpSpec,
+};
 
 pub struct Engine {
     // `encoder` is declared before `store` so it drops first (mirrors the old
@@ -25,6 +28,20 @@ pub struct Engine {
     store: Store,
     model_id: String,
     dim: usize,
+}
+
+/// A warp direction as a tool supplies it: text to encode and a magnitude,
+/// either a number or a level name resolved from the store's calibration.
+pub struct WarpPoint {
+    pub text: String,
+    pub magnitude: Magnitude,
+}
+
+/// One frame of a batch as a tool supplies it.
+pub struct BatchItem {
+    pub content: String,
+    pub metadata: Option<Value>,
+    pub occurred_at: Option<i64>,
 }
 
 // --------------------------------------------------------------------------- //
@@ -44,9 +61,9 @@ fn parse_opt(label: &str, s: Option<String>) -> Result<Value> {
     }
 }
 
-/// Named warp magnitudes (the by-vector warp API is float-level; names are
-/// resolved here before building the warp JSON).
-pub fn named_magnitude(name: &str) -> Option<f32> {
+/// Values for the named warp levels, used only when the store has no warp
+/// calibration of its own to resolve a name against.
+fn fallback_magnitude(name: &str) -> Option<f32> {
     match name {
         "action_floor" => Some(0.05),
         "routing" => Some(0.20),
@@ -56,57 +73,80 @@ pub fn named_magnitude(name: &str) -> Option<f32> {
     }
 }
 
-/// Resolve a tool-supplied magnitude (number or named string) to a float.
-pub fn resolve_mag(v: &Value) -> f32 {
+/// Read a tool-supplied magnitude: a number, or a level name.
+pub fn parse_magnitude(v: Option<&Value>) -> Result<Magnitude> {
     match v {
-        Value::Number(n) => n.as_f64().unwrap_or(0.20) as f32,
-        Value::String(s) => named_magnitude(s).unwrap_or(0.20),
-        _ => 0.20,
+        None | Some(Value::Null) => Ok(Magnitude::Named("routing".into())),
+        Some(Value::Number(n)) => Ok(Magnitude::Value(n.as_f64().unwrap_or(0.20) as f32)),
+        Some(Value::String(s)) => match s.trim().parse::<f32>() {
+            Ok(x) => Ok(Magnitude::Value(x)),
+            Err(_) if fallback_magnitude(s).is_some() => Ok(Magnitude::Named(s.clone())),
+            Err(_) => Err(anyhow!(
+                "unknown magnitude '{s}' — use a number or one of action_floor, routing, sub_saturation, saturation"
+            )),
+        },
+        Some(other) => Err(anyhow!("magnitude must be a number or a level name, got {other}")),
     }
 }
 
-/// A single search hit enriched with a content snippet.
-/// A frame's write time as an RFC 3339 string, decoded from its own id.
-///
-/// Frame ids are UUIDv7: the leading 48 bits are unix milliseconds, which is
-/// the same creation ordering the engine's recency sort follows. The time is
-/// therefore already in hand for every hit — no engine round trip needed.
-fn frame_timestamp_iso(frame_id: &str) -> Option<String> {
-    let hex: String = frame_id.chars().filter(|c| *c != '-').take(12).collect();
-    if hex.len() < 12 {
-        return None;
-    }
-    let ms = u64::from_str_radix(&hex, 16).ok()?;
-    chrono::DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.to_rfc3339())
-}
-
-#[cfg(test)]
-mod timestamp_tests {
-    use super::frame_timestamp_iso;
-
-    #[test]
-    fn decodes_write_time_from_the_v7_id() {
-        // A real frame id from the store: leading 48 bits are unix millis.
-        let iso = frame_timestamp_iso("019f97ad-194b-7ec9-929c-73cb3177d002").unwrap();
-        assert!(iso.starts_with("2026-07-25T"), "got {iso}");
-    }
-
-    #[test]
-    fn rejects_ids_that_are_not_v7() {
-        assert!(frame_timestamp_iso("").is_none());
-        assert!(frame_timestamp_iso("not-a-uuid").is_none());
-        assert!(frame_timestamp_iso("zzzzzzzz-zzzz-7000-8000-000000000000").is_none());
+/// Parse a tool-supplied warp profile.
+pub fn parse_profile(s: Option<&str>) -> Result<WarpProfile> {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("bounded") => Ok(WarpProfile::Bounded),
+        Some("routing") => Ok(WarpProfile::Routing),
+        Some("saturation") => Ok(WarpProfile::Saturation),
+        Some(other) => Err(anyhow!("unknown warp profile '{other}' — use bounded, routing, or saturation")),
     }
 }
 
-fn hit_to_value(frame_id: String, score: f32, confidence: f32, path_length: u32, snippet: Option<String>) -> Value {
+/// Microseconds since the epoch as an RFC 3339 string.
+fn iso(us: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(us).map(|dt| dt.to_rfc3339())
+}
+
+fn round4(x: f32) -> f64 {
+    (x as f64 * 10000.0).round() / 10000.0
+}
+
+fn chain_value(c: ChainResult) -> Value {
     json!({
-        "frame_id": frame_id,
-        "score": (score * 10000.0).round() / 10000.0,
-        "confidence": (confidence * 10000.0).round() / 10000.0,
-        "path_length": path_length,
-        "snippet": snippet,
+        "frame_ids": c.frame_ids,
+        "primitive": c.primitive,
+        "reached": c.reached,
+        "coherence": {
+            "mean_gradient": round4(c.coherence.mean_gradient),
+            "min_gradient": round4(c.coherence.min_gradient),
+            "fragmentation_events": c.coherence.fragmentation_events,
+            "pass_strict": c.coherence.pass_strict,
+            "pass_loose": c.coherence.pass_loose,
+            "stretch": if c.coherence.stretch.is_finite() { json!(round4(c.coherence.stretch)) } else { Value::Null },
+        },
     })
+}
+
+/// Metadata as the engine takes it: a JSON object. A JSON object sent as a
+/// string (clients facing a typeless schema stringify arguments) is unwrapped;
+/// any other value is kept under `value`, so nothing a caller sent is lost.
+fn metadata_map(m: Option<&Value>) -> Map<String, Value> {
+    match m {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(o)) => o.clone(),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Object(o)) => o,
+            _ => Map::from_iter([("value".to_string(), json!(s))]),
+        },
+        Some(other) => Map::from_iter([("value".to_string(), other.clone())]),
+    }
+}
+
+/// Turn the engine's refusal of an event time on an older store into advice.
+fn explain_format(e: seraph::Error) -> anyhow::Error {
+    let msg = e.to_string();
+    if msg.contains("format_version") || matches!(e, seraph::Error::Format(_)) {
+        anyhow!("{msg} — this memory store predates event time; migrate it to the current format to record when things happened")
+    } else {
+        anyhow!(msg)
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -132,10 +172,8 @@ impl Engine {
         let dim = store.dim();
 
         // Self-tuning warp: as the single-writer daemon, calibrate the store's
-        // own encoder + corpus once on load and persist it (a _seraph_warp_cal:
-        // System sentinel). Geometry-gated — a no-op on a fresh/undeveloped
-        // store — and re-persists only if a named magnitude drifted > 0.1.
-        // Named-magnitude warp resolves against this; non-fatal on error.
+        // own encoder + corpus once on load and persist it. Named warp levels
+        // resolve against this calibration. Non-fatal on error.
         match store.fixup_warp() {
             Ok(true) => eprintln!("seraph: warp (re)calibrated on load"),
             Ok(false) => {}
@@ -179,38 +217,44 @@ impl Engine {
 // write
 // --------------------------------------------------------------------------- //
 
-/// The engine FFI requires a JSON *object* string; anything else parses to an
-/// empty map with no error. Normalize the caller's value so nothing is
-/// silently lost: unwrap a JSON-object-in-a-string (clients facing a typeless
-/// schema stringify arguments), and wrap any other non-object as
-/// `{"value": ...}`.
-fn normalize_metadata(m: &Value) -> String {
-    match m {
-        Value::Object(_) => m.to_string(),
-        Value::String(s) => match serde_json::from_str::<Value>(s) {
-            Ok(v @ Value::Object(_)) => v.to_string(),
-            _ => json!({ "value": s }).to_string(),
-        },
-        Value::Null => "{}".to_string(),
-        other => json!({ "value": other }).to_string(),
-    }
-}
-
 impl Engine {
-    pub fn remember(&mut self, content: &str, metadata: Option<&Value>) -> Result<Value> {
+    /// Commit one text. `occurred_at` records when the content happened
+    /// (microseconds since the epoch), a claim bound into the frame's record.
+    pub fn remember(&mut self, content: &str, metadata: Option<&Value>, occurred_at: Option<i64>) -> Result<Value> {
         let emb = self.encode(content)?;
-        let meta_str = metadata.map(normalize_metadata).unwrap_or_else(|| "{}".to_string());
-        let fid = self.store.put_with_metadata(content.as_bytes(), &emb, &meta_str)?;
+        let options = PutOptions { metadata: metadata_map(metadata), occurred_at, ..Default::default() };
+        let fid = self.store.put_with(content.as_bytes(), &emb, &options).map_err(explain_format)?;
         Ok(json!({ "frame_id": fid }))
     }
 
-    pub fn remember_batch(&mut self, contents: &[String]) -> Result<Value> {
-        let embs = self.encode_batch(contents)?;
-        let mut ids = Vec::with_capacity(contents.len());
-        for (content, emb) in contents.iter().zip(embs.iter()) {
-            let fid = self.store.put(content.as_bytes(), emb)?;
-            ids.push(fid);
-        }
+    /// Commit many texts in one batched encode and one batch commit; each item
+    /// keeps its own metadata and event time.
+    pub fn remember_batch(&mut self, items: Vec<BatchItem>) -> Result<Value> {
+        let texts: Vec<String> = items.iter().map(|i| i.content.clone()).collect();
+        let embs = self.encode_batch(&texts)?;
+        let batch: Vec<PutItem> = items
+            .into_iter()
+            .zip(embs)
+            .map(|(item, embedding)| PutItem {
+                content: item.content.into_bytes(),
+                embedding,
+                options: PutOptions {
+                    metadata: metadata_map(item.metadata.as_ref()),
+                    occurred_at: item.occurred_at,
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let ids = match self.store.put_batch(&batch) {
+            Ok(ids) => ids,
+            Err(seraph::Error::BatchIncomplete { committed, message }) => {
+                self.store.sync().ok();
+                return Err(anyhow!("batch stopped after {} frame(s) ({message}); committed: {committed:?}", committed.len()));
+            }
+            Err(e) => return Err(explain_format(e)),
+        };
+        // A batch leaves the store buffered; this daemon commits each call.
+        self.store.sync()?;
         Ok(json!({ "frame_ids": ids, "count": ids.len() }))
     }
 
@@ -230,6 +274,19 @@ impl Engine {
 // search & retrieval
 // --------------------------------------------------------------------------- //
 
+/// What `recall` asks: how many hits, at what threshold, from which frames.
+pub struct RecallQuery {
+    pub query: String,
+    pub top_k: usize,
+    pub tau: f32,
+    pub include_superseded: bool,
+    pub order: TemporalOrder,
+    /// On when frames were written (the engine's commit time).
+    pub written: TimeWindow,
+    /// On when their content happened, for frames that record it.
+    pub occurred: TimeWindow,
+}
+
 impl Engine {
     /// Full decoded content of a frame (raw bytes, no base64 round-trip).
     fn content_full(&self, frame_id: &str) -> Option<String> {
@@ -248,49 +305,48 @@ impl Engine {
         Some(s)
     }
 
-    /// Semantic recall, optionally scoped to a time window and re-ordered by
-    /// recency. The window gates which frames may occupy a result slot and the
-    /// order is applied after selection — neither changes what the geometry
-    /// retrieves. When a temporal option is in play each hit also carries its
-    /// timestamp, since a recency-ordered list is not readable without one.
-    pub fn recall(
-        &mut self,
-        query: &str,
-        top_k: usize,
-        tau: f32,
-        include_superseded: bool,
-        order: TemporalOrder,
-        after_us: Option<u64>,
-        before_us: Option<u64>,
-    ) -> Result<Value> {
-        let emb = self.encode(query)?;
-        let temporal =
-            order != TemporalOrder::Relevance || after_us.is_some() || before_us.is_some();
-        let hits = self.store.search_temporal(
-            &emb,
-            top_k,
-            tau,
-            include_superseded,
-            order,
-            after_us,
-            before_us,
-        )?;
-        let results: Vec<Value> = hits
-            .into_iter()
-            .map(|h| {
-                let snip = self.content_snippet(&h.frame_id);
-                let ts = if temporal {
-                    frame_timestamp_iso(&h.frame_id)
-                } else {
-                    None
-                };
-                let mut v = hit_to_value(h.frame_id, h.score, h.confidence, h.path_length, snip);
-                if let (Some(obj), Some(ts)) = (v.as_object_mut(), ts) {
-                    obj.insert("timestamp".to_string(), json!(ts));
-                }
-                v
-            })
-            .collect();
+    /// A hit with its snippet. Its write time is included when `with_time` is
+    /// set (a time-scoped or recency-ordered recall), and the time its content
+    /// happened whenever the frame records one.
+    fn hit_value(&self, h: seraph::Hit, with_time: bool) -> Value {
+        let mut v = json!({
+            "frame_id": h.frame_id,
+            "score": round4(h.score),
+            "confidence": round4(h.confidence),
+            "path_length": h.path_length,
+            "snippet": self.content_snippet(&h.frame_id),
+        });
+        let obj = v.as_object_mut().expect("object");
+        if with_time {
+            if let Some(t) = iso(h.timestamp) {
+                obj.insert("timestamp".into(), json!(t));
+            }
+        }
+        if let Some(t) = h.occurred_at.and_then(iso) {
+            obj.insert("occurred_at".into(), json!(t));
+        }
+        v
+    }
+
+    /// Semantic recall, optionally scoped to when frames were written and when
+    /// their content happened, and re-ordered by time. The windows decide which
+    /// frames may occupy a result slot and the order is applied after
+    /// selection; neither changes what the geometry retrieves.
+    pub fn recall(&mut self, q: RecallQuery) -> Result<Value> {
+        let emb = self.encode(&q.query)?;
+        let with_time = q.order != TemporalOrder::Relevance
+            || q.written != TimeWindow::default()
+            || q.occurred != TimeWindow::default();
+        let options = SearchOptions {
+            top_k: q.top_k,
+            tau: Tau::Value(q.tau),
+            include_superseded: q.include_superseded,
+            time: TimeFilter { committed: q.written, occurred: q.occurred, ..Default::default() },
+            order: q.order,
+            ..Default::default()
+        };
+        let hits = self.store.search_with(&emb, &options)?.hits;
+        let results: Vec<Value> = hits.into_iter().map(|h| self.hit_value(h, with_time)).collect();
         Ok(json!(results))
     }
 
@@ -310,14 +366,51 @@ impl Engine {
         // Strip the bulky/binary fields and surface plain full content instead of
         // the base64 blob — callers want the text, not the vector.
         if let Some(obj) = v.as_object_mut() {
-            for k in ["embedding", "content_b64", "quantized", "quantized_fine"] {
+            for k in ["embedding", "content_b64", "codes_hex", "quantized", "quantized_fine"] {
                 obj.remove(k);
             }
             if let Some(content) = self.content_full(frame_id) {
                 obj.insert("content".to_string(), json!(content));
             }
+            for k in ["timestamp", "occurred_at"] {
+                if let Some(t) = obj.get(k).and_then(|x| x.as_i64()).and_then(iso) {
+                    obj.insert(format!("{k}_iso"), json!(t));
+                }
+            }
         }
         Ok(v)
+    }
+
+    /// The record's account of a frame: when it was written, when it became a
+    /// landmark (eigenframe) and how, and when it was retired and how.
+    pub fn lifecycle(&self, frame_id: &str) -> Result<Value> {
+        let Some(l) = self.store.lifecycle(frame_id)? else {
+            return Ok(json!({ "error": format!("frame not found: {frame_id}") }));
+        };
+        let event = |e: seraph::RecordEvent| json!({ "position": e.position, "at": iso(e.committed_at) });
+        Ok(json!({
+            "frame_id": l.frame_id,
+            "written": event(l.committed),
+            "occurred_at": l.occurred_at.and_then(iso),
+            "landmark": l.door.map(|(e, cause)| {
+                let mut v = event(e);
+                v["cause"] = json!(match cause {
+                    DoorCause::Genesis => "genesis",
+                    DoorCause::Seed => "seed",
+                    DoorCause::Threshold => "threshold",
+                    DoorCause::Manual => "manual",
+                });
+                v
+            }),
+            "retired": l.retired.map(|(e, how)| {
+                let mut v = event(e);
+                match how {
+                    Retirement::Superseded => { v["how"] = json!("superseded"); }
+                    Retirement::Consolidated { into } => { v["how"] = json!("consolidated"); v["into"] = json!(into); }
+                }
+                v
+            }),
+        }))
     }
 
     pub fn eigenframes(&self) -> Result<Value> {
@@ -326,28 +419,41 @@ impl Engine {
 }
 
 // --------------------------------------------------------------------------- //
-// chains, neighborhood, lineage
+// chains, neighborhood, lineage, strands
 // --------------------------------------------------------------------------- //
 
 impl Engine {
     pub fn chain(&self, from_id: &str, to_id: &str) -> Result<Value> {
-        parse_value(&self.store.chain_json(from_id, to_id)?)
+        let c = self.store.chain_with(Endpoint::Frame(from_id), Endpoint::Frame(to_id), &RouteOptions::default())?;
+        Ok(chain_value(c))
     }
 
     pub fn chain_to(&mut self, query: &str) -> Result<Value> {
         let emb = self.encode(query)?;
-        parse_value(&self.store.chain_to_json(&emb)?)
+        let c = self.store.chain_with(Endpoint::Entry, Endpoint::Query(&emb), &RouteOptions::default())?;
+        Ok(chain_value(c))
     }
 
     pub fn chain_between(&mut self, query_a: &str, query_b: &str) -> Result<Value> {
         let ea = self.encode(query_a)?;
         let eb = self.encode(query_b)?;
-        parse_value(&self.store.chain_between_json(&ea, &eb)?)
+        let c = self.store.chain_with(Endpoint::Query(&ea), Endpoint::Query(&eb), &RouteOptions::default())?;
+        Ok(chain_value(c))
     }
 
     pub fn neighborhood(&self, frame_id: &str, tau: Option<f32>, hops: usize) -> Result<Value> {
-        let tau = tau.unwrap_or_else(|| self.store.resolve_tau());
-        parse_value(&self.store.neighborhood_json(frame_id, tau, hops)?)
+        let options = NeighborhoodOptions { tau: tau.map_or(Tau::Background, Tau::Value), hops, warp: None };
+        let n = self.store.neighborhood_with(frame_id, &options)?;
+        let mut scores: Vec<(String, f32)> = n.scores.into_iter().collect();
+        scores.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(json!({
+            "consensus": n.consensus,
+            "geometric": n.geometric,
+            "lineage": n.lineage,
+            "tau_used": round4(n.tau_used),
+            "hops_used": n.hops_used,
+            "scores": scores.into_iter().map(|(k, v)| (k, json!(round4(v)))).collect::<Map<String, Value>>(),
+        }))
     }
 
     pub fn lineage(&self, frame_id: &str) -> Result<Value> {
@@ -357,6 +463,20 @@ impl Engine {
     pub fn evolution(&self, seed_frame_id: &str) -> Result<Value> {
         parse_opt("evolution", self.store.evolution_json(seed_frame_id))
     }
+
+    /// What a frame was built on (`forward = false`) or what was later built on
+    /// it (`forward = true`): a strand through the frames it attached to when
+    /// it was written, or that attached to it. `tau = None` stops at the
+    /// frame's own background.
+    pub fn strand(&self, frame_id: &str, forward: bool, tau: Option<f32>) -> Result<Value> {
+        let options = StrandOptions { tau: tau.map_or(Tau::QueryBackground, Tau::Value), ..Default::default() };
+        let c = if forward {
+            self.store.influence_with(frame_id, &options)?
+        } else {
+            self.store.provenance_with(frame_id, &options)?
+        };
+        Ok(chain_value(c))
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -364,96 +484,105 @@ impl Engine {
 // --------------------------------------------------------------------------- //
 
 impl Engine {
-    /// Encode each `(text, magnitude)` pair into the canonical warp JSON
-    /// `[{"embedding": [...], "magnitude": f32}, ...]` consumed by the engine's
-    /// by-vector warp API (see `seraph::Store::search_with_warp`).
-    fn warp_points_json(&mut self, items: &[(String, f32)]) -> Result<String> {
-        let mut arr: Vec<Value> = Vec::with_capacity(items.len());
-        for (text, mag) in items {
-            let emb = self.encode(text)?;
-            arr.push(json!({ "embedding": emb, "magnitude": mag }));
+    /// A warp spec from text points. Named levels resolve against the store's
+    /// own calibration; a store with none falls back to fixed values.
+    fn warp_spec(&mut self, targets: &[WarpPoint], suppress: &[WarpPoint], profile: WarpProfile, bound_k: f32) -> Result<WarpSpec> {
+        let mut side = |points: &[WarpPoint]| -> Result<Vec<(WarpInput, Magnitude)>> {
+            points.iter().map(|p| Ok((WarpInput::Embedding(self.encode(&p.text)?), p.magnitude.clone()))).collect()
+        };
+        let (t, s) = (side(targets)?, side(suppress)?);
+        Ok(WarpSpec { targets: t, suppress: s, profile, bound_k, ..Default::default() })
+    }
+
+    /// Compile a spec against the store, returning the spec as compiled. If a
+    /// named level does not resolve (the store has no calibration yet), the
+    /// fixed values stand in for it.
+    fn compile(&self, spec: WarpSpec) -> Result<(WarpSpec, seraph::Warp)> {
+        match self.store.compile_warp_spec(&spec) {
+            Ok(w) => Ok((spec, w)),
+            Err(e) if e.to_string().contains("named magnitude") => {
+                let fixed = |side: &[(WarpInput, Magnitude)]| -> Vec<(WarpInput, Magnitude)> {
+                    side.iter().map(|(i, m)| (i.clone(), match m {
+                        Magnitude::Named(n) => Magnitude::Value(fallback_magnitude(n).unwrap_or(0.20)),
+                        v => v.clone(),
+                    })).collect()
+                };
+                let spec = WarpSpec { targets: fixed(&spec.targets), suppress: fixed(&spec.suppress), ..spec };
+                let w = self.store.compile_warp_spec(&spec)?;
+                Ok((spec, w))
+            }
+            Err(e) => Err(e.into()),
         }
-        Ok(Value::Array(arr).to_string())
     }
 
     pub fn recall_with_warp(
         &mut self,
         query: &str,
-        targets: &[(String, f32)],
-        suppress: &[(String, f32)],
-        profile: &str,
+        targets: &[WarpPoint],
+        suppress: &[WarpPoint],
+        profile: WarpProfile,
         bound_k: f32,
         top_k: usize,
         tau: f32,
     ) -> Result<Value> {
         let emb = self.encode(query)?;
-        let tjson = self.warp_points_json(targets)?;
-        let sjson = self.warp_points_json(suppress)?;
-        let hits = self
-            .store
-            .search_with_warp(&emb, &tjson, &sjson, profile, bound_k, top_k, tau)?;
-        let results: Vec<Value> = hits
-            .into_iter()
-            .map(|h| {
-                let snip = self.content_snippet(&h.frame_id);
-                hit_to_value(h.frame_id, h.score, h.confidence, h.path_length, snip)
-            })
-            .collect();
-        Ok(json!({ "profile": profile, "results": results }))
-    }
-
-    /// Apply a warp field to an embedding (pure math, no search).
-    fn apply_warp(
-        &mut self,
-        emb: &[f32],
-        targets: &[(String, f32)],
-        suppress: &[(String, f32)],
-        profile: &str,
-        bound_k: f32,
-    ) -> Result<Vec<f32>> {
-        let tjson = self.warp_points_json(targets)?;
-        let sjson = self.warp_points_json(suppress)?;
-        Ok(seraph::apply_warp(emb, &tjson, &sjson, profile, bound_k)?)
+        let spec = self.warp_spec(targets, suppress, profile, bound_k)?;
+        let (_, warp) = self.compile(spec)?;
+        let options = SearchOptions { top_k, tau: Tau::Value(tau), warp: Some(&warp), ..Default::default() };
+        let hits = self.store.search_with(&emb, &options)?.hits;
+        let results: Vec<Value> = hits.into_iter().map(|h| self.hit_value(h, false)).collect();
+        Ok(json!({ "profile": format!("{profile:?}").to_ascii_lowercase(), "results": results }))
     }
 
     pub fn warp_chain_to(
         &mut self,
         query: &str,
-        targets: &[(String, f32)],
-        suppress: &[(String, f32)],
-        profile: &str,
+        targets: &[WarpPoint],
+        suppress: &[WarpPoint],
+        profile: WarpProfile,
         bound_k: f32,
     ) -> Result<Value> {
         let emb = self.encode(query)?;
-        let warped = self.apply_warp(&emb, targets, suppress, profile, bound_k)?;
-        parse_value(&self.store.chain_to_json(&warped)?)
+        let spec = self.warp_spec(targets, suppress, profile, bound_k)?;
+        let (_, warp) = self.compile(spec)?;
+        let options = RouteOptions { warp: Some(&warp), ..Default::default() };
+        Ok(chain_value(self.store.chain_with(Endpoint::Entry, Endpoint::Query(&emb), &options)?))
     }
 
+    /// Route between two concepts, each end warped by its own targets.
     pub fn warp_chain_between(
         &mut self,
         query_a: &str,
         query_b: &str,
-        targets_a: &[(String, f32)],
-        targets_b: &[(String, f32)],
-        profile: &str,
+        targets_a: &[WarpPoint],
+        targets_b: &[WarpPoint],
+        profile: WarpProfile,
         bound_k: f32,
     ) -> Result<Value> {
         let ea = self.encode(query_a)?;
         let eb = self.encode(query_b)?;
-        let wa = if targets_a.is_empty() { ea } else { self.apply_warp(&ea, targets_a, &[], profile, bound_k)? };
-        let wb = if targets_b.is_empty() { eb } else { self.apply_warp(&eb, targets_b, &[], profile, bound_k)? };
-        parse_value(&self.store.chain_between_json(&wa, &wb)?)
+        let mut warped = |emb: Vec<f32>, targets: &[WarpPoint]| -> Result<Vec<f32>> {
+            if targets.is_empty() {
+                return Ok(emb);
+            }
+            let spec = self.warp_spec(targets, &[], profile, bound_k)?;
+            let (spec, _) = self.compile(spec)?;
+            Ok(self.store.warp_query(&emb, &spec.to_json())?)
+        };
+        let wa = warped(ea, targets_a)?;
+        let wb = warped(eb, targets_b)?;
+        Ok(chain_value(self.store.chain_with(Endpoint::Query(&wa), Endpoint::Query(&wb), &RouteOptions::default())?))
     }
 
     pub fn seed_margin(&self, frame_id: &str) -> Result<Value> {
         let m = self.store.seed_margin(frame_id);
-        Ok(json!({ "frame_id": frame_id, "seed_margin": (m * 10000.0).round() / 10000.0 }))
+        Ok(json!({ "frame_id": frame_id, "seed_margin": round4(m) }))
     }
 
     pub fn steerability(&mut self, query: &str, target_id: &str) -> Result<Value> {
         let emb = self.encode(query)?;
         let d = self.store.steerability(&emb, target_id);
-        Ok(json!({ "target_id": target_id, "displacement": (d * 1_000_000.0).round() / 1_000_000.0 }))
+        Ok(json!({ "target_id": target_id, "displacement": (d as f64 * 1_000_000.0).round() / 1_000_000.0 }))
     }
 
     pub fn calibrate_warp(&self, n_queries: usize) -> Result<Value> {
@@ -491,8 +620,7 @@ impl Engine {
         relations: Option<&[String]>,
         direction: &str,
     ) -> Result<Value> {
-        // The engine treats an empty JSON array as "no relation filter" (all
-        // relations); a null pointer is an error, so default to "[]".
+        // An empty JSON array means "no relation filter" (all relations).
         let rels = relations
             .map(|r| Value::Array(r.iter().map(|s| json!(s)).collect()).to_string())
             .unwrap_or_else(|| "[]".to_string());
@@ -530,7 +658,7 @@ impl Engine {
 
     pub fn density(&self, frame_id: &str) -> Result<Value> {
         let s = self.store.density_score(frame_id);
-        Ok(json!({ "frame_id": frame_id, "density_score": (s * 10000.0).round() / 10000.0 }))
+        Ok(json!({ "frame_id": frame_id, "density_score": round4(s) }))
     }
 
     pub fn region_health(&self, eigenframe_id: &str) -> Result<Value> {

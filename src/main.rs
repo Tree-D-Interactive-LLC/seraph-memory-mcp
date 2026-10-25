@@ -22,7 +22,7 @@ use rmcp::{
 };
 use serde_json::Value;
 
-use store::{resolve_mag, Engine};
+use store::{parse_magnitude, parse_profile, BatchItem, Engine, RecallQuery};
 
 const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -31,14 +31,14 @@ const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
 // --------------------------------------------------------------------------- //
 
 /// Parse a caller-supplied time expression into microseconds since the Unix
-/// epoch, which is what the engine's temporal window takes.
+/// epoch, which is what the engine's time windows and event times take.
 ///
 /// Accepted forms, in the order they are tried:
 /// - relative age — `30m`, `24h`, `7d`, `2w`: that long *before now*
 /// - raw epoch microseconds — a bare integer, for programmatic callers
 /// - RFC 3339 timestamp — `2026-07-01T14:30:00Z`
 /// - plain date — `2026-07-01`, read as midnight UTC
-fn parse_time_us(s: &str) -> Result<u64, String> {
+fn parse_time_us(s: &str) -> Result<i64, String> {
     let t = s.trim();
     if t.is_empty() {
         return Err("empty time value".into());
@@ -66,7 +66,7 @@ fn parse_time_us(s: &str) -> Result<u64, String> {
                 let delta = chrono::Duration::try_seconds(total)
                     .ok_or_else(|| format!("time span '{t}' is out of range"))?;
                 let then = chrono::Utc::now() - delta;
-                return Ok(then.timestamp_micros().max(0) as u64);
+                return Ok(then.timestamp_micros());
             }
         }
     }
@@ -74,17 +74,17 @@ fn parse_time_us(s: &str) -> Result<u64, String> {
     // Raw epoch microseconds.
     if t.chars().all(|c| c.is_ascii_digit()) {
         return t
-            .parse::<u64>()
+            .parse::<i64>()
             .map_err(|_| format!("'{t}' is not a valid epoch-microsecond value"));
     }
 
     // Absolute timestamps.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
-        return Ok(dt.timestamp_micros().max(0) as u64);
+        return Ok(dt.timestamp_micros());
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d") {
         if let Some(dt) = date.and_hms_opt(0, 0, 0) {
-            return Ok(dt.and_utc().timestamp_micros().max(0) as u64);
+            return Ok(dt.and_utc().timestamp_micros());
         }
     }
 
@@ -92,6 +92,11 @@ fn parse_time_us(s: &str) -> Result<u64, String> {
         "unrecognized time '{t}' — use a relative age (7d), a date (2026-07-01), \
          an RFC 3339 timestamp, or epoch microseconds"
     ))
+}
+
+/// Parse an optional time argument, reporting a bad one as invalid params.
+fn opt_time(s: Option<&str>) -> Result<Option<i64>, McpError> {
+    s.map(parse_time_us).transpose().map_err(|e| McpError::invalid_params(e, None))
 }
 
 /// Parse the caller's `order` string into the engine's presentation order.
@@ -133,12 +138,29 @@ pub struct RememberReq {
     pub content: String,
     #[schemars(schema_with = "metadata_schema")]
     pub metadata: Option<Value>,
+    #[schemars(description = "When the content happened, if that is not now — the date of a \
+        meeting, a decision, an event. Same formats as recall's `after`. The time of writing is \
+        recorded regardless; this is a separate claim, kept with the frame.")]
+    pub occurred_at: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BatchItemReq {
+    #[schemars(description = "Text content to commit.")]
+    pub content: String,
+    #[schemars(schema_with = "metadata_schema")]
+    pub metadata: Option<Value>,
+    #[schemars(description = "When the content happened, if that is not now.")]
+    pub occurred_at: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RememberBatchReq {
-    #[schemars(description = "List of texts to commit; encoded in one batched pass.")]
-    pub contents: Vec<String>,
+    #[schemars(description = "Texts to commit, without metadata. Pass this or `items`.")]
+    pub contents: Option<Vec<String>>,
+    #[schemars(description = "Frames to commit, each with its own metadata and event time. Pass \
+        this or `contents`.")]
+    pub items: Option<Vec<BatchItemReq>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -176,8 +198,15 @@ pub struct RecallReq {
         \"what changed since ...\" questions.")]
     pub after: Option<String>,
     #[schemars(description = "Only return frames written at or before this time. Same formats as \
-        `after`.")]
+        `after`. Also scopes the search to the memory as it stood then.")]
     pub before: Option<String>,
+    #[schemars(description = "Only return frames whose content happened at or after this time — \
+        the `occurred_at` given when they were remembered, or their write time if none was given. \
+        Same formats as `after`.")]
+    pub occurred_after: Option<String>,
+    #[schemars(description = "Only return frames whose content happened at or before this time. \
+        Same formats as `after`.")]
+    pub occurred_before: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -213,10 +242,20 @@ pub struct NeighborhoodReq {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct WarpPoint {
+pub struct StrandReq {
+    #[schemars(description = "Frame ID.")]
+    pub frame_id: String,
+    #[schemars(description = "Similarity floor for each step (omit to stop at the frame's own \
+        background similarity).")]
+    pub tau: Option<f32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WarpPointReq {
     #[schemars(description = "Text to encode as a warp direction (or an existing frame's text).")]
     pub input: String,
-    #[schemars(description = "Magnitude: a float, or a named level: action_floor(0.05), routing(0.20), sub_saturation(0.80), saturation(1.50). Default routing.")]
+    #[schemars(description = "Magnitude: a float, or a named level resolved from this store's \
+        calibration: action_floor, routing, sub_saturation, saturation. Default routing.")]
     pub magnitude: Option<Value>,
 }
 
@@ -225,9 +264,9 @@ pub struct RecallWarpReq {
     #[schemars(description = "Search query text.")]
     pub query: String,
     #[schemars(description = "Warp targets to pull the query toward.")]
-    pub targets: Option<Vec<WarpPoint>>,
+    pub targets: Option<Vec<WarpPointReq>>,
     #[schemars(description = "Warp suppressions to push the query away from.")]
-    pub suppress: Option<Vec<WarpPoint>>,
+    pub suppress: Option<Vec<WarpPointReq>>,
     #[schemars(description = "Profile: bounded (default), routing, or saturation.")]
     pub profile: Option<String>,
     #[schemars(description = "Bound parameter (default 1.5).")]
@@ -241,8 +280,8 @@ pub struct RecallWarpReq {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct WarpChainToReq {
     pub query: String,
-    pub targets: Option<Vec<WarpPoint>>,
-    pub suppress: Option<Vec<WarpPoint>>,
+    pub targets: Option<Vec<WarpPointReq>>,
+    pub suppress: Option<Vec<WarpPointReq>>,
     #[schemars(description = "Profile: bounded (default), routing, or saturation.")]
     pub profile: Option<String>,
     pub bound_k: Option<f32>,
@@ -252,8 +291,8 @@ pub struct WarpChainToReq {
 pub struct WarpChainBetweenReq {
     pub query_a: String,
     pub query_b: String,
-    pub targets_a: Option<Vec<WarpPoint>>,
-    pub targets_b: Option<Vec<WarpPoint>>,
+    pub targets_a: Option<Vec<WarpPointReq>>,
+    pub targets_b: Option<Vec<WarpPointReq>>,
     #[schemars(description = "Profile: bounded (default), routing, or saturation.")]
     pub profile: Option<String>,
     pub bound_k: Option<f32>,
@@ -325,14 +364,19 @@ pub struct DriftReq {
 // helpers
 // --------------------------------------------------------------------------- //
 
-fn to_points(v: Option<Vec<WarpPoint>>) -> Vec<(String, f32)> {
+fn to_points(v: Option<Vec<WarpPointReq>>) -> Result<Vec<store::WarpPoint>, McpError> {
     v.unwrap_or_default()
         .into_iter()
         .map(|p| {
-            let mag = p.magnitude.as_ref().map(resolve_mag).unwrap_or(0.20);
-            (p.input, mag)
+            let magnitude = parse_magnitude(p.magnitude.as_ref())
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            Ok(store::WarpPoint { text: p.input, magnitude })
         })
         .collect()
+}
+
+fn to_profile(s: Option<&str>) -> Result<seraph::WarpProfile, McpError> {
+    parse_profile(s).map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
 fn ok_json(v: Value) -> Result<CallToolResult, McpError> {
@@ -387,14 +431,32 @@ impl SeraphMemory {
 impl SeraphMemory {
     // ---- write ----
     #[tool(description = "Commit a piece of text to memory. The store places it geometrically by \
-        similarity to everything already present and returns its frame ID.")]
+        similarity to everything already present and returns its frame ID. Give occurred_at when \
+        the content describes something that happened at another time than now.")]
     async fn remember(&self, Parameters(r): Parameters<RememberReq>) -> Result<CallToolResult, McpError> {
-        self.run(move |e| e.remember(&r.content, r.metadata.as_ref())).await
+        let occurred_at = opt_time(r.occurred_at.as_deref())?;
+        self.run(move |e| e.remember(&r.content, r.metadata.as_ref(), occurred_at)).await
     }
 
-    #[tool(description = "Commit many texts at once (batched encode, one GPU pass). Returns frame IDs.")]
+    #[tool(description = "Commit many texts at once (batched encode, one GPU pass), in the order \
+        given. Pass `contents` for plain texts or `items` for texts with their own metadata and \
+        occurred_at. Returns frame IDs.")]
     async fn remember_batch(&self, Parameters(r): Parameters<RememberBatchReq>) -> Result<CallToolResult, McpError> {
-        self.run(move |e| e.remember_batch(&r.contents)).await
+        let items: Vec<BatchItem> = match (r.contents, r.items) {
+            (Some(contents), None) => contents
+                .into_iter()
+                .map(|content| BatchItem { content, metadata: None, occurred_at: None })
+                .collect(),
+            (None, Some(items)) => items
+                .into_iter()
+                .map(|i| {
+                    let occurred_at = opt_time(i.occurred_at.as_deref())?;
+                    Ok(BatchItem { content: i.content, metadata: i.metadata, occurred_at })
+                })
+                .collect::<Result<_, McpError>>()?,
+            _ => return Err(McpError::invalid_params("pass either `contents` or `items`", None)),
+        };
+        self.run(move |e| e.remember_batch(items)).await
     }
 
     #[tool(description = "Add a domain seed — an eigenframe from birth that anchors a region of the \
@@ -415,26 +477,33 @@ impl SeraphMemory {
         relevant hits sorted newest-first (it reorders, it does not search further back in \
         relevance — raise top_k for more depth); after/before scope which frames may occupy a \
         result slot, taking a relative age (\"7d\"), a date (\"2026-07-01\"), or an RFC 3339 \
-        timestamp — use after for \"what changed since ...\". When either is set, each hit also \
-        carries its RFC 3339 timestamp.")]
+        timestamp — use after for \"what changed since ...\"; before also reads the memory as it \
+        stood at that time. occurred_after/occurred_before scope by when the content happened \
+        (the occurred_at given at remember time, else the write time). When any time option is \
+        set, each hit carries its write timestamp; a hit whose frame records occurred_at always \
+        carries it.")]
     async fn recall(&self, Parameters(r): Parameters<RecallReq>) -> Result<CallToolResult, McpError> {
         let top_k = r.top_k.unwrap_or(10) as usize;
         let tau = r.tau.unwrap_or(0.5);
         let include_superseded = r.include_superseded.unwrap_or(false);
         let order = parse_order(r.order.as_deref())
             .map_err(|e| McpError::invalid_params(e, None))?;
-        let after_us = match r.after.as_deref() {
-            Some(s) => Some(parse_time_us(s).map_err(|e| McpError::invalid_params(e, None))?),
-            None => None,
+        let q = RecallQuery {
+            query: r.query,
+            top_k,
+            tau,
+            include_superseded,
+            order,
+            written: seraph::TimeWindow {
+                after_us: opt_time(r.after.as_deref())?,
+                before_us: opt_time(r.before.as_deref())?,
+            },
+            occurred: seraph::TimeWindow {
+                after_us: opt_time(r.occurred_after.as_deref())?,
+                before_us: opt_time(r.occurred_before.as_deref())?,
+            },
         };
-        let before_us = match r.before.as_deref() {
-            Some(s) => Some(parse_time_us(s).map_err(|e| McpError::invalid_params(e, None))?),
-            None => None,
-        };
-        self.run(move |e| {
-            e.recall(&r.query, top_k, tau, include_superseded, order, after_us, before_us)
-        })
-        .await
+        self.run(move |e| e.recall(q)).await
     }
 
     #[tool(description = "Soft-forget a frame: mark it superseded so it stops surfacing in recall \
@@ -448,6 +517,13 @@ impl SeraphMemory {
     #[tool(description = "Fetch a single frame by ID (content, status, parent, metadata, in-degree).")]
     async fn get_frame(&self, Parameters(r): Parameters<FrameIdReq>) -> Result<CallToolResult, McpError> {
         self.run(move |e| e.get_frame(&r.frame_id)).await
+    }
+
+    #[tool(description = "A frame's history in the record: when it was written, when (and how) it \
+        became a landmark, when (and how) it was retired by supersede or consolidation, and the \
+        occurred_at it claims, if any.")]
+    async fn lifecycle(&self, Parameters(r): Parameters<FrameIdReq>) -> Result<CallToolResult, McpError> {
+        self.run(move |e| e.lifecycle(&r.frame_id)).await
     }
 
     #[tool(description = "List eigenframes — the store's emergent table of contents (landmark regions).")]
@@ -500,6 +576,19 @@ impl SeraphMemory {
         self.run(move |e| e.lineage(&r.frame_id)).await
     }
 
+    #[tool(description = "Provenance: what a frame was built on. Follows the frames it connected to \
+        when it was written, back through earlier frames, and returns the strand with coherence \
+        metrics. Unlike lineage (the parent tree), this follows similarity links too.")]
+    async fn provenance(&self, Parameters(r): Parameters<StrandReq>) -> Result<CallToolResult, McpError> {
+        self.run(move |e| e.strand(&r.frame_id, false, r.tau)).await
+    }
+
+    #[tool(description = "Influence: what was later built on a frame. Follows the frames written \
+        after it that connected to it, forward in time. The counterpart of provenance.")]
+    async fn influence(&self, Parameters(r): Parameters<StrandReq>) -> Result<CallToolResult, McpError> {
+        self.run(move |e| e.strand(&r.frame_id, true, r.tau)).await
+    }
+
     // The forward counterpart to `lineage`: it descends the same ingestion tree from the seed's region.
     // EMPIRICAL CAVEAT (engine seraph.dll, FFI shape undocumented/PLACEHOLDER): in practice this only
     // resolves from the GENESIS / region-root seed. Content frames — and even eigenframes — that
@@ -516,39 +605,39 @@ impl SeraphMemory {
     // ---- warp ----
     #[tool(description = "Warped recall — reshape the query vector before retrieval to bias toward \
         targets and away from suppressions. Enables cross-domain bridging and anti-repetition. \
-        Run warp_calibration once per session before using named magnitudes (defaults assume 1024d).")]
+        Named magnitudes resolve against this store's own calibration.")]
     async fn recall_with_warp(&self, Parameters(r): Parameters<RecallWarpReq>) -> Result<CallToolResult, McpError> {
-        let targets = to_points(r.targets);
-        let suppress = to_points(r.suppress);
-        let profile = r.profile.unwrap_or_else(|| "bounded".into());
+        let targets = to_points(r.targets)?;
+        let suppress = to_points(r.suppress)?;
+        let profile = to_profile(r.profile.as_deref())?;
         let bound_k = r.bound_k.unwrap_or(1.5);
         let top_k = r.top_k.unwrap_or(10) as usize;
         let tau = r.tau.unwrap_or(0.5);
         let query = r.query;
-        self.run(move |e| e.recall_with_warp(&query, &targets, &suppress, &profile, bound_k, top_k, tau))
+        self.run(move |e| e.recall_with_warp(&query, &targets, &suppress, profile, bound_k, top_k, tau))
             .await
     }
 
     #[tool(description = "Warped chain_to — chain to the knowledge matching a query after steering \
         the query vector toward targets / away from suppressions.")]
     async fn warp_chain_to(&self, Parameters(r): Parameters<WarpChainToReq>) -> Result<CallToolResult, McpError> {
-        let targets = to_points(r.targets);
-        let suppress = to_points(r.suppress);
-        let profile = r.profile.unwrap_or_else(|| "bounded".into());
+        let targets = to_points(r.targets)?;
+        let suppress = to_points(r.suppress)?;
+        let profile = to_profile(r.profile.as_deref())?;
         let bound_k = r.bound_k.unwrap_or(1.5);
         let query = r.query;
-        self.run(move |e| e.warp_chain_to(&query, &targets, &suppress, &profile, bound_k)).await
+        self.run(move |e| e.warp_chain_to(&query, &targets, &suppress, profile, bound_k)).await
     }
 
     #[tool(description = "Warped chain_between — chain between two concepts with per-endpoint warp steering.")]
     async fn warp_chain_between(&self, Parameters(r): Parameters<WarpChainBetweenReq>) -> Result<CallToolResult, McpError> {
-        let ta = to_points(r.targets_a);
-        let tb = to_points(r.targets_b);
-        let profile = r.profile.unwrap_or_else(|| "bounded".into());
+        let ta = to_points(r.targets_a)?;
+        let tb = to_points(r.targets_b)?;
+        let profile = to_profile(r.profile.as_deref())?;
         let bound_k = r.bound_k.unwrap_or(1.5);
         let qa = r.query_a;
         let qb = r.query_b;
-        self.run(move |e| e.warp_chain_between(&qa, &qb, &ta, &tb, &profile, bound_k)).await
+        self.run(move |e| e.warp_chain_between(&qa, &qb, &ta, &tb, profile, bound_k)).await
     }
 
     #[tool(description = "Seed margin: geometric distinctness of a frame vs the corpus centroid. \
@@ -564,7 +653,8 @@ impl SeraphMemory {
     }
 
     #[tool(description = "Calibrate warp magnitudes against this store's actual corpus and encoder \
-        (dimension-correct regime boundaries). Run once per session before using named magnitudes.")]
+        (dimension-correct regime boundaries). The store recalibrates itself on load when its \
+        corpus has moved; run this to recalibrate now, or to inspect the levels.")]
     async fn warp_calibration(&self, Parameters(r): Parameters<CalibrateReq>) -> Result<CallToolResult, McpError> {
         let n = r.n_queries.unwrap_or(30) as usize;
         self.run(move |e| e.calibrate_warp(n)).await
@@ -657,9 +747,13 @@ impl ServerHandler for SeraphMemory {
              global store is open at {}. Use `remember` to commit knowledge and `recall` to search \
              by meaning; `chain`/`chain_between` to explain how things connect; `neighborhood` for \
              three-population context; declared relations (`declare_relation`/`assert_relation`/\
-             `structural_neighbors`) for exact structure. WARP: run `warp_calibration` once per \
-             session before named magnitudes (defaults assume 1024d). Use `routing` magnitude for \
-             gentle steering, `saturation` only for cross-domain bridging; keep profile=bounded.",
+             `structural_neighbors`) for exact structure; `provenance`/`influence` for what a \
+             frame was built on and what was built on it; `lifecycle` for a frame's history. \
+             TIME: `remember` takes occurred_at for content about another time; `recall` scopes \
+             by write time (after/before) or by when content happened (occurred_after/\
+             occurred_before). WARP: named magnitudes resolve against the store's own \
+             calibration. Use `routing` magnitude for gentle steering, `saturation` only for \
+             cross-domain bridging; keep profile=bounded.",
             self.store_path
         ))
     }
@@ -943,16 +1037,16 @@ mod tests {
     use super::{parse_order, parse_time_us};
     use seraph::TemporalOrder;
 
-    fn now_us() -> u64 {
-        chrono::Utc::now().timestamp_micros() as u64
+    fn now_us() -> i64 {
+        chrono::Utc::now().timestamp_micros()
     }
 
     #[test]
     fn relative_ages_resolve_into_the_past() {
         let now = now_us();
-        for (expr, secs) in [("90s", 90u64), ("30m", 1_800), ("24h", 86_400), ("7d", 604_800), ("2w", 1_209_600)] {
+        for (expr, secs) in [("90s", 90i64), ("30m", 1_800), ("24h", 86_400), ("7d", 604_800), ("2w", 1_209_600)] {
             let t = parse_time_us(expr).expect(expr);
-            let delta = now.saturating_sub(t);
+            let delta = now - t;
             let expected = secs * 1_000_000;
             // Generous tolerance — the clock advances between the two reads.
             assert!(
@@ -980,6 +1074,8 @@ mod tests {
         );
         // Raw epoch microseconds pass through untouched.
         assert_eq!(parse_time_us("1751328000000000").unwrap(), 1_751_328_000_000_000);
+        // Dates before the epoch are event times like any other.
+        assert_eq!(parse_time_us("1969-07-20").unwrap(), -14_256_000_000_000);
     }
 
     #[test]

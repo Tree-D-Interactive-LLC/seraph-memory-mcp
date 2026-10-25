@@ -11,16 +11,16 @@
 //!   1. `SERAPH_LIB_DIR` env var — explicit override pointing at a local engine
 //!      build (a directory with `seraph.dll` + `seraph.dll.lib`). Use this for
 //!      offline builds or to test an unreleased engine.
-//!   2. The **latest** GitHub release of Tree-D-Interactive-LLC/seraph: resolve
-//!      the newest release via the GitHub API, download the
-//!      `*-ffi-windows-x86_64-gpu.zip` asset (candle GPU + CPU fallback,
-//!      self-contained — no external runtime), and cache it under OUT_DIR keyed
-//!      by release tag. This is the source of truth; there is no vendored copy.
+//!   2. The GitHub release of Tree-D-Interactive-LLC/seraph whose tag the
+//!      `seraph` dependency in Cargo.toml pins (the latest release when it pins
+//!      none): download its `*-ffi-windows-x86_64-gpu.zip` asset (candle GPU +
+//!      CPU fallback, self-contained — no external runtime) and cache it under
+//!      OUT_DIR keyed by release tag. This is the source of truth; there is no
+//!      vendored copy.
 //!
-//! NOTE: the engine DLL exposes a C ABI; the `seraph` crate (git dependency on
-//! the engine repo) provides the matching bindings. Across compatible releases
-//! the ABI is stable,
-//! but if a release changes FFI signatures, bump the `seraph` crate to match.
+//! The engine DLL exposes a C ABI and the `seraph` crate provides the matching
+//! bindings, so both come from the same release: bumping the tag in Cargo.toml
+//! moves the bindings and the DLL together, and reruns this script.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -66,6 +66,7 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=SERAPH_LIB_DIR");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 }
 
 /// Resolve the directory holding `seraph.dll` + `seraph.dll.lib`.
@@ -75,20 +76,37 @@ fn resolve_ffi_dir(out_dir: &PathBuf) -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    // 2. Latest GitHub release FFI build (the source of truth).
-    match fetch_latest_ffi(out_dir) {
+    // 2. The GitHub release the bindings are pinned to (the source of truth).
+    let tag = pinned_tag();
+    match fetch_release_ffi(out_dir, tag.as_deref()) {
         Ok(dir) => dir,
         Err(e) => panic!(
-            "could not obtain the SERAPH engine DLL from the latest GitHub release ({e}). \
+            "could not obtain the SERAPH engine DLL from GitHub release {} ({e}). \
              Set SERAPH_LIB_DIR to a local engine build (a directory containing seraph.dll \
-             + seraph.dll.lib), or restore network access to GitHub."
+             + seraph.dll.lib), or restore network access to GitHub.",
+            tag.as_deref().unwrap_or("latest")
         ),
     }
 }
 
-/// Resolve + download + extract the latest release FFI zip. Cached by tag.
-fn fetch_latest_ffi(out_dir: &PathBuf) -> Result<PathBuf, String> {
-    let (tag, url) = latest_asset_url()?;
+/// The release tag the `seraph` dependency in Cargo.toml pins, if any.
+fn pinned_tag() -> Option<String> {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?).join("Cargo.toml");
+    let text = fs::read_to_string(manifest).ok()?;
+    let line = text.lines().find(|l| {
+        let l = l.trim_start();
+        (l.starts_with("seraph ") || l.starts_with("seraph=")) && l.contains("tag")
+    })?;
+    let after = &line[line.find("tag")? + 3..];
+    let q1 = after.find('"')? + 1;
+    let q2 = after[q1..].find('"')? + q1;
+    Some(after[q1..q2].to_string())
+}
+
+/// Resolve + download + extract a release's FFI zip (the latest when `tag` is
+/// `None`). Cached by tag.
+fn fetch_release_ffi(out_dir: &PathBuf, tag: Option<&str>) -> Result<PathBuf, String> {
+    let (tag, url) = release_asset_url(tag)?;
 
     let cache = out_dir.join(format!("seraph-ffi-{tag}"));
     let dll = cache.join("seraph.dll");
@@ -115,10 +133,13 @@ fn fetch_latest_ffi(out_dir: &PathBuf) -> Result<PathBuf, String> {
     }
 }
 
-/// Query the GitHub API for the latest release and return (tag, asset_url) for
-/// the FFI build whose name ends with `ASSET_SUFFIX`.
-fn latest_asset_url() -> Result<(String, String), String> {
-    let api = format!("https://api.github.com/repos/{REPO}/releases/latest");
+/// Query the GitHub API for a release (the latest when `tag` is `None`) and
+/// return (tag, asset_url) for the FFI build whose name ends with `ASSET_SUFFIX`.
+fn release_asset_url(tag: Option<&str>) -> Result<(String, String), String> {
+    let api = match tag {
+        Some(t) => format!("https://api.github.com/repos/{REPO}/releases/tags/{t}"),
+        None => format!("https://api.github.com/repos/{REPO}/releases/latest"),
+    };
     let out = Command::new("curl")
         .args(["-fsSL", "-H", "User-Agent: seraph-memory-build", "-H", "Accept: application/vnd.github+json", &api])
         .output()
@@ -140,7 +161,7 @@ fn latest_asset_url() -> Result<(String, String), String> {
         }
         pos = next;
     }
-    let url = url.ok_or_else(|| format!("no asset matching *{ASSET_SUFFIX} in latest release"))?;
+    let url = url.ok_or_else(|| format!("no asset matching *{ASSET_SUFFIX} in release {}", tag.unwrap_or("latest")))?;
 
     let tag = quoted_value_after(&json, "\"tag_name\"", 0)
         .map(|(v, _)| v)

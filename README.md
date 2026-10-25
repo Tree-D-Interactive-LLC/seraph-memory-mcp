@@ -8,41 +8,57 @@ wrapper crate. No Python runtime, no PyO3.
 
 One global store, the engine's own on-device encoder, and a curated set of
 substrate tools: *remember / recall*, reasoning **chains**, three-population
-**neighborhoods**, **contradiction** detection, **lineage** / provenance,
-**warp** steering, declared **typed relations**, and diagnostics.
+**neighborhoods**, **contradiction** detection, **lineage**, **provenance** and
+**influence**, each frame's **lifecycle**, **warp** steering, declared **typed
+relations**, and diagnostics.
 
 ## Tools
 
 | Group | Tools |
 |-------|-------|
 | Write | `remember`, `remember_batch`, `add_seed`, `promote_frame` |
-| Recall | `recall`, `get_frame`, `eigenframes_list` |
+| Recall | `recall`, `get_frame`, `lifecycle`, `eigenframes_list` |
 | Chains | `chain`, `chain_to`, `chain_between` |
-| Context / provenance | `neighborhood`, `lineage`, `evolution` |
+| Context / provenance | `neighborhood`, `lineage`, `provenance`, `influence`, `evolution` |
 | Warp (steering) | `recall_with_warp`, `warp_chain_to`, `warp_chain_between`, `warp_seed_margin`, `warp_steerability`, `warp_calibration` |
 | Declared structure | `declare_relation`, `list_relations`, `assert_relation`, `retract_relation`, `structural_neighbors` |
 | Diagnostics | `stats`, `contradictions`, `density`, `region_health`, `drift_report`, `verify` |
 
-**Warp note:** run `warp_calibration` once per session before using named
-magnitudes (`routing`, `saturation`, …) — defaults assume 1024-d and are wrong on
-the 384-d default encoder. Keep `profile=bounded`.
+**Warp note:** named magnitudes (`action_floor`, `routing`, `sub_saturation`,
+`saturation`) resolve against the store's own calibration, which the server
+refreshes on load when the corpus has moved; `warp_calibration` recalibrates now
+and shows the levels. Keep `profile=bounded`.
 
-### Temporal recall
+### Time
 
-`recall` is primarily a search by *meaning*, but three optional arguments let you
-scope or re-present those hits by write time — for "what changed since …" and
-"what did we conclude most recently" questions.
+A memory has two times: when it was **written** (recorded by the engine) and,
+optionally, when its content **happened** (`occurred_at`, given at `remember`
+time — the date of a meeting, a decision, an event). `remember_batch` takes
+`items`, each with its own `metadata` and `occurred_at`, or plain `contents`.
+
+`recall` is primarily a search by *meaning*; these optional arguments scope or
+re-present its hits in time:
 
 | Argument | Effect |
 |----------|--------|
 | `after` | Only frames written at or after this time |
-| `before` | Only frames written at or before this time |
+| `before` | Only frames written at or before this time; the memory as it stood then |
+| `occurred_after` | Only frames whose content happened at or after this time (their write time when they give none) |
+| `occurred_before` | Only frames whose content happened at or before this time |
 | `order` | `relevance` (default), `most_recent`, or `oldest` |
 
-`after` / `before` accept a **relative age** (`30m`, `24h`, `7d`, `2w` — that long
-ago), a **plain date** (`2026-07-01`, read as midnight UTC), an **RFC 3339
-timestamp** (`2026-07-01T14:30:00Z`), or raw **epoch microseconds**. When either
-is set, every hit also carries its RFC 3339 timestamp.
+Times accept a **relative age** (`30m`, `24h`, `7d`, `2w` — that long ago), a
+**plain date** (`2026-07-01`, read as midnight UTC), an **RFC 3339 timestamp**
+(`2026-07-01T14:30:00Z`), or raw **epoch microseconds**. When any time option is
+set, every hit carries its write timestamp; a hit whose frame gives
+`occurred_at` always carries it.
+
+Event time needs a store at the current format. On an older store `remember`
+refuses `occurred_at` with that advice, and the `occurred_*` windows fall back
+to write time. Migrating an older store records each memory's original write
+time as its `occurred_at`; from then on `after`/`before` see the migration as
+every memory's write time, and `occurred_after`/`occurred_before` answer about
+its history.
 
 > **`order` reorders, it does not search further back.** `most_recent` sorts the
 > *same* relevant hits newest-first, so a recent frame that wasn't relevant enough
