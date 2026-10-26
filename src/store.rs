@@ -263,6 +263,11 @@ impl Engine {
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
+
+    /// Flush every buffered write to disk, so the file holds the whole store.
+    pub fn sync(&mut self) -> Result<()> {
+        Ok(self.store.sync()?)
+    }
     pub fn dim(&self) -> usize {
         self.dim
     }

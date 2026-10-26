@@ -120,7 +120,9 @@ happened.
 ## Requirements
 
 - **Windows x86_64** with the **MSVC toolchain** (`x86_64-pc-windows-msvc`). The
-  engine ships an MSVC import library, so the GNU toolchain won't link.
+  engine ships an MSVC import library, so the GNU toolchain won't link. **Linux
+  x86_64** builds too, for the [hosted mode](#hosted-mode--one-memory-across-machines)
+  (it links the release's `libseraph.so`).
 - **Rust** (stable) and network access on first build (see below).
 - A **SERAPH license** at `%APPDATA%\SERAPH\license.key` is required only to
   **create** a new store — activate once with `seraph license activate` (the same
@@ -220,6 +222,45 @@ server runs a **shared-daemon** model (Windows):
 
 No configuration change is needed: the registered command is the same exe; it
 decides client-vs-daemon at startup.
+
+## Hosted mode — one memory across machines
+
+The same server can run on a host and serve its store over MCP's streamable
+HTTP transport, so every Claude session that connects — on any machine — works
+in one memory. The server is the store's single writer-of-record, as the daemon
+is for the sessions of one machine.
+
+```sh
+SERAPH_MEMORY_TOKEN=<token> SERAPH_MEMORY_HOSTS=memory.example.com \
+  seraph-memory-rs --store /data/memory.sfg --http 0.0.0.0:8080
+```
+
+| Endpoint | |
+|----------|---|
+| `/mcp` | The MCP endpoint. Requires `Authorization: Bearer <SERAPH_MEMORY_TOKEN>`. |
+| `/backup` | The store file as it stands, written to disk under the engine lock first, so the download is a complete store. Same token. |
+| `/health` | `ok`, unauthenticated, for health checks. |
+
+- **`SERAPH_MEMORY_TOKEN`** (required) — the bearer token every request carries.
+- **`SERAPH_MEMORY_HOSTS`** — the host names the server answers to, comma
+  separated. Defaults to loopback only, which guards a local server against DNS
+  rebinding; a public deployment lists its own domain.
+- It runs **stateless** with JSON responses: every request stands alone, so a
+  restart or a proxy in front never strands a session.
+- It shuts down cleanly on SIGTERM, closing the store.
+- On a CPU-only host the engine falls back from GPU to CPU; a query encode takes
+  about 150 ms, and the encoder model is downloaded to `$HOME/.cache/seraph` on
+  first use.
+
+Point each machine at it:
+
+```powershell
+claude mcp add --transport http seraph-memory https://memory.example.com/mcp --header "Authorization: Bearer <token>"
+```
+
+A backup is one request from anywhere: `curl -H "Authorization: Bearer <token>"
+https://memory.example.com/backup -o memory.sfg`. The engine rebuilds its
+`.gidx` index on open, so the `.sfg` alone restores the store.
 
 ## License
 

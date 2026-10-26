@@ -1,20 +1,23 @@
-//! Build script: obtain the SERAPH engine DLL, link its import library, and
-//! place the runtime DLL next to the produced binary so it is found at load
-//! time.
+//! Build script: obtain the SERAPH engine library, link it, and place it next
+//! to the produced binary so it is found at load time.
 //!
-//! The MSVC linker expects the bare name `seraph.lib`, but the release ships
-//! `seraph.dll.lib`, so we copy it under that name into OUT_DIR and link from
-//! there. We then copy `seraph.dll` into the target profile dir (e.g.
-//! `target/release/`) so the .exe can load it as a sibling.
+//! Windows: the MSVC linker expects the bare name `seraph.lib`, but the release
+//! ships `seraph.dll.lib`, so we copy it under that name into OUT_DIR and link
+//! from there, then copy `seraph.dll` into the target profile dir (e.g.
+//! `target/release/`) so the .exe can load it as a sibling. Linux: we link
+//! `libseraph.so` directly, copy it beside the binary, and give the binary an
+//! `$ORIGIN` rpath so it is found there.
 //!
 //! FFI directory resolution:
 //!   1. `SERAPH_LIB_DIR` env var — explicit override pointing at a local engine
-//!      build (a directory with `seraph.dll` + `seraph.dll.lib`). Use this for
-//!      offline builds or to test an unreleased engine.
+//!      build (a directory with `seraph.dll` + `seraph.dll.lib`, or
+//!      `libseraph.so`). Use this for offline builds or to test an unreleased
+//!      engine.
 //!   2. The GitHub release of Tree-D-Interactive-LLC/seraph the bindings come
 //!      from: the tag the `seraph` dependency in Cargo.toml pins, else the
 //!      version Cargo.lock resolved it to (`0.4.1` is release `v0.4.1`), else
-//!      the latest release. Download its `*-ffi-windows-x86_64-gpu.zip` asset
+//!      the latest release. Download its `*-ffi-windows-x86_64-gpu.zip` or
+//!      `*-ffi-linux-x86_64-gpu.tar.gz` asset
 //!      (candle GPU + CPU fallback, self-contained — no external runtime) and
 //!      cache it under OUT_DIR keyed by release tag. This is the source of
 //!      truth; there is no vendored copy.
@@ -30,41 +33,71 @@ use std::process::Command;
 use std::{env, fs};
 
 const REPO: &str = "Tree-D-Interactive-LLC/seraph";
-/// Asset suffix for the self-contained candle-GPU Windows FFI build.
-const ASSET_SUFFIX: &str = "-ffi-windows-x86_64-gpu.zip";
+
+/// What the engine release ships for the target OS: the self-contained
+/// candle-GPU FFI asset (CPU fallback), the runtime library, and the file the
+/// linker reads.
+struct Platform {
+    asset_suffix: &'static str,
+    runtime_lib: &'static str,
+    link_lib: &'static str,
+}
+
+fn platform() -> Platform {
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux") => Platform {
+            asset_suffix: "-ffi-linux-x86_64-gpu.tar.gz",
+            runtime_lib: "libseraph.so",
+            link_lib: "libseraph.so",
+        },
+        _ => Platform {
+            asset_suffix: "-ffi-windows-x86_64-gpu.zip",
+            runtime_lib: "seraph.dll",
+            link_lib: "seraph.dll.lib",
+        },
+    }
+}
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let platform = platform();
 
-    let ffi_dir = resolve_ffi_dir(&out_dir);
-    let dll = ffi_dir.join("seraph.dll");
-    let import_lib = ffi_dir.join("seraph.dll.lib");
+    let ffi_dir = resolve_ffi_dir(&out_dir, &platform);
+    let runtime_lib = ffi_dir.join(platform.runtime_lib);
+    let link_lib = ffi_dir.join(platform.link_lib);
 
-    if !dll.exists() || !import_lib.exists() {
+    if !runtime_lib.exists() || !link_lib.exists() {
         panic!(
-            "SERAPH FFI not found under {} (expected seraph.dll + seraph.dll.lib). \
+            "SERAPH FFI not found under {} (expected {} + {}). \
              Set SERAPH_LIB_DIR to a local engine build, or ensure the GitHub release \
              is reachable.",
-            ffi_dir.display()
+            ffi_dir.display(),
+            platform.runtime_lib,
+            platform.link_lib
         );
     }
 
-    // Copy the import lib to the name MSVC's linker expects: `seraph.lib`.
-    let staged_lib = out_dir.join("seraph.lib");
-    fs::copy(&import_lib, &staged_lib).expect("copy seraph.dll.lib -> seraph.lib");
-
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    if platform.link_lib == platform.runtime_lib {
+        // Linux links the shared object itself and finds it beside the binary at run time.
+        println!("cargo:rustc-link-search=native={}", ffi_dir.display());
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+    } else {
+        // Copy the import lib to the name MSVC's linker expects: `seraph.lib`.
+        let staged_lib = out_dir.join("seraph.lib");
+        fs::copy(&link_lib, &staged_lib).expect("copy seraph.dll.lib -> seraph.lib");
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    }
     println!("cargo:rustc-link-lib=dylib=seraph");
 
-    // Place seraph.dll next to the output binary. OUT_DIR looks like
+    // Place the runtime library next to the output binary. OUT_DIR looks like
     // `target/<profile>/build/<pkg-hash>/out`; the profile dir is three parents up.
     if let Some(profile_dir) = out_dir.ancestors().nth(3) {
-        let dest = profile_dir.join("seraph.dll");
+        let dest = profile_dir.join(platform.runtime_lib);
         // Best-effort copy; ignore "file in use" if the server is running.
-        let _ = fs::copy(&dll, &dest);
+        let _ = fs::copy(&runtime_lib, &dest);
         // Also copy into the deps dir, where test/example binaries run from.
-        let deps = profile_dir.join("deps").join("seraph.dll");
-        let _ = fs::copy(&dll, &deps);
+        let deps = profile_dir.join("deps").join(platform.runtime_lib);
+        let _ = fs::copy(&runtime_lib, &deps);
     }
 
     println!("cargo:rerun-if-env-changed=SERAPH_LIB_DIR");
@@ -73,8 +106,8 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
 }
 
-/// Resolve the directory holding `seraph.dll` + `seraph.dll.lib`.
-fn resolve_ffi_dir(out_dir: &PathBuf) -> PathBuf {
+/// Resolve the directory holding the engine library for this platform.
+fn resolve_ffi_dir(out_dir: &PathBuf, platform: &Platform) -> PathBuf {
     // 1. Explicit override (local engine build / offline).
     if let Ok(dir) = env::var("SERAPH_LIB_DIR") {
         return PathBuf::from(dir);
@@ -82,13 +115,14 @@ fn resolve_ffi_dir(out_dir: &PathBuf) -> PathBuf {
 
     // 2. The GitHub release the bindings come from (the source of truth).
     let tag = pinned_tag().or_else(locked_tag);
-    match fetch_release_ffi(out_dir, tag.as_deref()) {
+    match fetch_release_ffi(out_dir, tag.as_deref(), platform) {
         Ok(dir) => dir,
         Err(e) => panic!(
-            "could not obtain the SERAPH engine DLL from GitHub release {} ({e}). \
-             Set SERAPH_LIB_DIR to a local engine build (a directory containing seraph.dll \
-             + seraph.dll.lib), or restore network access to GitHub.",
-            tag.as_deref().unwrap_or("latest")
+            "could not obtain the SERAPH engine library from GitHub release {} ({e}). \
+             Set SERAPH_LIB_DIR to a local engine build (a directory containing {}), or \
+             restore network access to GitHub.",
+            tag.as_deref().unwrap_or("latest"),
+            platform.runtime_lib
         ),
     }
 }
@@ -122,39 +156,39 @@ fn locked_tag() -> Option<String> {
     None
 }
 
-/// Resolve + download + extract a release's FFI zip (the latest when `tag` is
-/// `None`). Cached by tag.
-fn fetch_release_ffi(out_dir: &PathBuf, tag: Option<&str>) -> Result<PathBuf, String> {
-    let (tag, url) = release_asset_url(tag)?;
+/// Resolve + download + extract a release's FFI archive (the latest when `tag`
+/// is `None`). Cached by tag.
+fn fetch_release_ffi(out_dir: &PathBuf, tag: Option<&str>, platform: &Platform) -> Result<PathBuf, String> {
+    let (tag, url) = release_asset_url(tag, platform.asset_suffix)?;
 
     let cache = out_dir.join(format!("seraph-ffi-{tag}"));
-    let dll = cache.join("seraph.dll");
-    if dll.exists() {
+    let lib = cache.join(platform.runtime_lib);
+    if lib.exists() {
         return Ok(cache); // already downloaded for this release
     }
 
     fs::create_dir_all(&cache).map_err(|e| format!("create cache dir: {e}"))?;
-    let zip = out_dir.join(format!("seraph-ffi-{tag}.zip"));
+    let archive = out_dir.join(format!("seraph-ffi-{tag}{}", platform.asset_suffix));
 
     // Download (curl is bundled on Windows 10+).
-    run("curl", &["-fsSL", "-o", &zip.to_string_lossy(), &url])
+    run("curl", &["-fsSL", "-o", &archive.to_string_lossy(), &url])
         .map_err(|e| format!("curl download {url}: {e}"))?;
 
-    // Extract (Windows `tar` is bsdtar and reads zips).
-    run("tar", &["-xf", &zip.to_string_lossy(), "-C", &cache.to_string_lossy()])
+    // Extract (Windows `tar` is bsdtar and reads zips; GNU tar reads the gzip).
+    run("tar", &["-xf", &archive.to_string_lossy(), "-C", &cache.to_string_lossy()])
         .map_err(|e| format!("tar extract: {e}"))?;
-    let _ = fs::remove_file(&zip);
+    let _ = fs::remove_file(&archive);
 
-    if dll.exists() {
+    if lib.exists() {
         Ok(cache)
     } else {
-        Err("seraph.dll not present after extraction".into())
+        Err(format!("{} not present after extraction", platform.runtime_lib))
     }
 }
 
 /// Query the GitHub API for a release (the latest when `tag` is `None`) and
-/// return (tag, asset_url) for the FFI build whose name ends with `ASSET_SUFFIX`.
-fn release_asset_url(tag: Option<&str>) -> Result<(String, String), String> {
+/// return (tag, asset_url) for the FFI build whose name ends with `suffix`.
+fn release_asset_url(tag: Option<&str>, suffix: &str) -> Result<(String, String), String> {
     let api = match tag {
         Some(t) => format!("https://api.github.com/repos/{REPO}/releases/tags/{t}"),
         None => format!("https://api.github.com/repos/{REPO}/releases/latest"),
@@ -174,13 +208,13 @@ fn release_asset_url(tag: Option<&str>) -> Result<(String, String), String> {
     let mut pos = 0;
     let mut url = None;
     while let Some((val, next)) = quoted_value_after(&json, "\"browser_download_url\"", pos) {
-        if val.ends_with(ASSET_SUFFIX) {
+        if val.ends_with(suffix) {
             url = Some(val);
             break;
         }
         pos = next;
     }
-    let url = url.ok_or_else(|| format!("no asset matching *{ASSET_SUFFIX} in release {}", tag.unwrap_or("latest")))?;
+    let url = url.ok_or_else(|| format!("no asset matching *{suffix} in release {}", tag.unwrap_or("latest")))?;
 
     let tag = quoted_value_after(&json, "\"tag_name\"", 0)
         .map(|(v, _)| v)

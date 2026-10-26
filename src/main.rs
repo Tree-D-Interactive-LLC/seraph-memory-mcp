@@ -1192,6 +1192,139 @@ mod bridge {
     }
 }
 
+// --------------------------------------------------------------------------- //
+// hosted mode (`--http <addr>`)
+//
+// Serves the same tools over MCP's streamable HTTP transport, so sessions on
+// other machines share this one store: the server is the store's single
+// writer-of-record, as the daemon is for the sessions of one machine. It runs
+// stateless with JSON responses — every request stands alone — so a restart or
+// a proxy in front never strands a session. `/mcp` and `/backup` require
+// `Authorization: Bearer <SERAPH_MEMORY_TOKEN>`; `/health` is open.
+// `SERAPH_MEMORY_HOSTS` lists the host names the server answers to (comma
+// separated; loopback only by default, which guards a local server against DNS
+// rebinding).
+// --------------------------------------------------------------------------- //
+mod http {
+    use super::*;
+    use axum::{
+        body::Body,
+        extract::{Request, State},
+        http::{header, StatusCode},
+        middleware::{self, Next},
+        response::{IntoResponse, Response},
+        routing::get,
+        Router,
+    };
+    use rmcp::transport::streamable_http_server::{
+        session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    pub async fn run(path: &Path, addr: &str) -> anyhow::Result<()> {
+        let token = std::env::var("SERAPH_MEMORY_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--http needs SERAPH_MEMORY_TOKEN, the bearer token every request must carry"))?;
+        let hosts: Vec<String> = std::env::var("SERAPH_MEMORY_HOSTS")
+            .ok()
+            .map(|v| v.split(',').map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect())
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]);
+
+        let engine = open_engine_or_exit(path);
+        let handler = SeraphMemory::new(engine, path.to_string_lossy().to_string());
+        let config = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .with_allowed_hosts(hosts.clone());
+        let session = handler.clone();
+        let mcp = StreamableHttpService::new(
+            move || Ok(session.clone()),
+            Arc::new(NeverSessionManager::default()),
+            config,
+        );
+
+        let backup_route = {
+            let engine = handler.engine.clone();
+            let path = path.to_path_buf();
+            move || backup(engine.clone(), path.clone())
+        };
+        let gated = Router::new()
+            .route_service("/mcp", mcp)
+            .route("/backup", get(backup_route))
+            .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
+        let app = Router::new().route("/health", get(|| async { "ok" })).merge(gated);
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("serving MCP over HTTP on {addr} for hosts {hosts:?}");
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+        // Dropping the last handle closes the store cleanly before exit.
+        drop(handler);
+        tracing::info!("shut down");
+        Ok(())
+    }
+
+    /// Ctrl-C, or the SIGTERM a container platform sends before stopping us.
+    async fn shutdown_signal() {
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        #[cfg(unix)]
+        let term = async {
+            if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                s.recv().await;
+            }
+        };
+        #[cfg(not(unix))]
+        let term = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term => {}
+        }
+    }
+
+    /// Admit a request only with the bearer token, compared in constant time.
+    async fn require_token(State(token): State<Arc<String>>, req: Request, next: Next) -> Response {
+        let given = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let ok = given.is_some_and(|g| {
+            g.len() == token.len() && g.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        });
+        if ok {
+            next.run(req).await
+        } else {
+            (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "missing or wrong bearer token\n")
+                .into_response()
+        }
+    }
+
+    /// The store file as it stands: written to disk under the engine lock, so
+    /// no write lands while it is read. A copy of this is a complete backup.
+    async fn backup(engine: Arc<Mutex<Engine>>, path: PathBuf) -> Response {
+        let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let mut guard = engine.lock().map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
+            guard.sync()?;
+            Ok(std::fs::read(&path)?)
+        })
+        .await;
+        match read {
+            Ok(Ok(bytes)) => {
+                let name = format!("memory-{}.sfg", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))
+                    .body(Body::from(bytes))
+                    .expect("valid response")
+            }
+            Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("backup failed: {e}\n")).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("backup task failed: {e}\n")).into_response(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1204,6 +1337,12 @@ async fn main() -> anyhow::Result<()> {
 
     let path = resolve_store_path();
     tracing::info!("SERAPH memory store: {}", path.display());
+
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--http") {
+        let addr = args.get(i + 1).map(String::as_str).unwrap_or("127.0.0.1:8765");
+        return http::run(&path, addr).await;
+    }
 
     #[cfg(windows)]
     {
