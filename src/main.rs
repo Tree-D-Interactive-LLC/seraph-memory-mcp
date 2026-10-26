@@ -507,9 +507,28 @@ fn ok_json(v: Value) -> Result<CallToolResult, McpError> {
 // server
 // --------------------------------------------------------------------------- //
 
+/// The engine behind the tools: open, or closed after an idle spell (hosted
+/// mode) and reopened by the next call that needs it.
+pub struct EngineSlot {
+    engine: Option<Engine>,
+    path: PathBuf,
+    last_used: std::time::Instant,
+}
+
+impl EngineSlot {
+    /// The open engine, reopening the store if it was closed.
+    fn get(&mut self) -> anyhow::Result<&mut Engine> {
+        if self.engine.is_none() {
+            self.engine = Some(open_engine(&self.path)?);
+            tracing::info!("store reopened");
+        }
+        Ok(self.engine.as_mut().expect("engine just opened"))
+    }
+}
+
 #[derive(Clone)]
 pub struct SeraphMemory {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Mutex<EngineSlot>>,
     store_path: String,
     #[allow(dead_code)]
     tool_router: ToolRouter<SeraphMemory>,
@@ -517,8 +536,13 @@ pub struct SeraphMemory {
 
 impl SeraphMemory {
     fn new(engine: Engine, store_path: String) -> Self {
+        let slot = EngineSlot {
+            engine: Some(engine),
+            path: PathBuf::from(&store_path),
+            last_used: std::time::Instant::now(),
+        };
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(Mutex::new(slot)),
             store_path,
             tool_router: Self::tool_router(),
         }
@@ -534,7 +558,9 @@ impl SeraphMemory {
             let mut guard = engine
                 .lock()
                 .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
-            f(&mut guard)
+            let result = f(guard.get()?);
+            guard.last_used = std::time::Instant::now();
+            result
         })
         .await
         .map_err(|e| McpError::internal_error(format!("task join error: {e}"), None))?;
@@ -1203,7 +1229,9 @@ mod bridge {
 // `Authorization: Bearer <SERAPH_MEMORY_TOKEN>`; `/health` is open.
 // `SERAPH_MEMORY_HOSTS` lists the host names the server answers to (comma
 // separated; loopback only by default, which guards a local server against DNS
-// rebinding).
+// rebinding). After `SERAPH_MEMORY_IDLE_SECS` (default 900; 0 never) without a
+// tool call it closes the store and drops the encoder, handing their memory
+// back to the OS; the next call reopens them.
 // --------------------------------------------------------------------------- //
 mod http {
     use super::*;
@@ -1219,6 +1247,7 @@ mod http {
     use rmcp::transport::streamable_http_server::{
         session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
+    use std::time::Duration;
 
     pub async fn run(path: &Path, addr: &str) -> anyhow::Result<()> {
         let token = std::env::var("SERAPH_MEMORY_TOKEN")
@@ -1255,8 +1284,16 @@ mod http {
             .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
         let app = Router::new().route("/health", get(|| async { "ok" })).merge(gated);
 
+        let idle = std::env::var("SERAPH_MEMORY_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(900);
+        if idle > 0 {
+            spawn_idle_closer(handler.engine.clone(), Duration::from_secs(idle));
+        }
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("serving MCP over HTTP on {addr} for hosts {hosts:?}");
+        tracing::info!("serving MCP over HTTP on {addr} for hosts {hosts:?}; idle close after {idle}s");
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
         // Dropping the last handle closes the store cleanly before exit.
         drop(handler);
@@ -1301,12 +1338,72 @@ mod http {
         }
     }
 
+    /// Close the store once no tool call has used it for `idle`. The check
+    /// takes the engine lock, so a close never lands mid-call.
+    fn spawn_idle_closer(slot: Arc<Mutex<EngineSlot>>, idle: Duration) {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(idle.min(Duration::from_secs(30)));
+            loop {
+                tick.tick().await;
+                let slot = slot.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let Ok(mut guard) = slot.lock() else { return };
+                    if guard.engine.is_none() || guard.last_used.elapsed() < idle {
+                        return;
+                    }
+                    let before = rss_mb();
+                    // Dropping the engine closes the encoder, then the store.
+                    drop(guard.engine.take());
+                    release_memory(&guard.path);
+                    match (before, rss_mb()) {
+                        (Some(b), Some(a)) => tracing::info!("idle {idle:?}: store closed; RSS {b:.0} MB -> {a:.0} MB"),
+                        _ => tracing::info!("idle {idle:?}: store closed"),
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
+    /// The process's resident memory, where the OS reports it.
+    fn rss_mb() -> Option<f64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kb: f64 = status.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb / 1024.0)
+    }
+
+    /// Hand freed memory back to the OS. glibc keeps freed heap in its arenas
+    /// (the engine allocates from many worker threads), so trim them; and drop
+    /// the store's pages from the page cache, which counts against a container.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn release_memory(path: &Path) {
+        use std::os::fd::AsRawFd;
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+            fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+        }
+        const POSIX_FADV_DONTNEED: i32 = 4;
+        unsafe { malloc_trim(0) };
+        let gidx = PathBuf::from(format!("{}.gidx", path.display()));
+        for p in [path.to_path_buf(), gidx] {
+            if let Ok(f) = std::fs::File::open(&p) {
+                unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED) };
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn release_memory(_path: &Path) {}
+
     /// The store file as it stands: written to disk under the engine lock, so
     /// no write lands while it is read. A copy of this is a complete backup.
-    async fn backup(engine: Arc<Mutex<Engine>>, path: PathBuf) -> Response {
+    /// A closed store is already whole on disk, so it is read as it is.
+    async fn backup(slot: Arc<Mutex<EngineSlot>>, path: PathBuf) -> Response {
         let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let mut guard = engine.lock().map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
-            guard.sync()?;
+            let mut guard = slot.lock().map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
+            if let Some(engine) = guard.engine.as_mut() {
+                engine.sync()?;
+            }
             Ok(std::fs::read(&path)?)
         })
         .await;

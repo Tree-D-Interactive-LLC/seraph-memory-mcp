@@ -245,6 +245,12 @@ SERAPH_MEMORY_TOKEN=<token> SERAPH_MEMORY_HOSTS=memory.example.com \
 - **`SERAPH_MEMORY_HOSTS`** — the host names the server answers to, comma
   separated. Defaults to loopback only, which guards a local server against DNS
   rebinding; a public deployment lists its own domain.
+- **`SERAPH_MEMORY_IDLE_SECS`** — after this long without a tool call (default
+  900; `0` never), the server closes the store and drops the encoder, handing
+  their memory back to the OS (on Linux it trims glibc's heap and drops the
+  store's pages from the page cache). The next call reopens them, paying about
+  a second for the store and the encoder's load. `/health` and `/backup` don't
+  count as use, and `/backup` reads a closed store as it is on disk.
 - It runs **stateless** with JSON responses: every request stands alone, so a
   restart or a proxy in front never strands a session.
 - It shuts down cleanly on SIGTERM, closing the store.
