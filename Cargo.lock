@@ -540,7 +540,7 @@ dependencies = [
 [[package]]
 name = "seraph"
 version = "0.4.1"
-source = "git+https://github.com/Tree-D-Interactive-LLC/seraph?tag=v0.4.1#597c8ba8d2961d2334669f8eaf303b54958eca3f"
+source = "git+https://github.com/Tree-D-Interactive-LLC/seraph#597c8ba8d2961d2334669f8eaf303b54958eca3f"
 dependencies = [
  "serde_json",
 ]

@@ -11,16 +11,19 @@
 //!   1. `SERAPH_LIB_DIR` env var — explicit override pointing at a local engine
 //!      build (a directory with `seraph.dll` + `seraph.dll.lib`). Use this for
 //!      offline builds or to test an unreleased engine.
-//!   2. The GitHub release of Tree-D-Interactive-LLC/seraph whose tag the
-//!      `seraph` dependency in Cargo.toml pins (the latest release when it pins
-//!      none): download its `*-ffi-windows-x86_64-gpu.zip` asset (candle GPU +
-//!      CPU fallback, self-contained — no external runtime) and cache it under
-//!      OUT_DIR keyed by release tag. This is the source of truth; there is no
-//!      vendored copy.
+//!   2. The GitHub release of Tree-D-Interactive-LLC/seraph the bindings come
+//!      from: the tag the `seraph` dependency in Cargo.toml pins, else the
+//!      version Cargo.lock resolved it to (`0.4.1` is release `v0.4.1`), else
+//!      the latest release. Download its `*-ffi-windows-x86_64-gpu.zip` asset
+//!      (candle GPU + CPU fallback, self-contained — no external runtime) and
+//!      cache it under OUT_DIR keyed by release tag. This is the source of
+//!      truth; there is no vendored copy.
 //!
 //! The engine DLL exposes a C ABI and the `seraph` crate provides the matching
-//! bindings, so both come from the same release: bumping the tag in Cargo.toml
-//! moves the bindings and the DLL together, and reruns this script.
+//! bindings, so both come from the same release: `cargo update -p seraph` (or
+//! bumping a pinned tag) moves the bindings and the DLL together, and reruns
+//! this script. Taking the latest release regardless of the lock would pair the
+//! locked bindings with a newer DLL as soon as a release is published.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -67,6 +70,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SERAPH_LIB_DIR");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
 }
 
 /// Resolve the directory holding `seraph.dll` + `seraph.dll.lib`.
@@ -76,8 +80,8 @@ fn resolve_ffi_dir(out_dir: &PathBuf) -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    // 2. The GitHub release the bindings are pinned to (the source of truth).
-    let tag = pinned_tag();
+    // 2. The GitHub release the bindings come from (the source of truth).
+    let tag = pinned_tag().or_else(locked_tag);
     match fetch_release_ffi(out_dir, tag.as_deref()) {
         Ok(dir) => dir,
         Err(e) => panic!(
@@ -101,6 +105,21 @@ fn pinned_tag() -> Option<String> {
     let q1 = after.find('"')? + 1;
     let q2 = after[q1..].find('"')? + q1;
     Some(after[q1..q2].to_string())
+}
+
+/// The release tag of the `seraph` version Cargo.lock resolved, if there is a
+/// lock: `version = "0.4.1"` under `name = "seraph"` is release `v0.4.1`.
+fn locked_tag() -> Option<String> {
+    let lock = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?).join("Cargo.lock");
+    let text = fs::read_to_string(lock).ok()?;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "name = \"seraph\"" {
+            let version = lines.next()?.trim().strip_prefix("version = \"")?.strip_suffix('"')?;
+            return Some(format!("v{version}"));
+        }
+    }
+    None
 }
 
 /// Resolve + download + extract a release's FFI zip (the latest when `tag` is

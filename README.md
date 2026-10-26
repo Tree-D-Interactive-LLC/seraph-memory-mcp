@@ -137,15 +137,26 @@ cargo build --release
 
 1. If `SERAPH_LIB_DIR` is set, it links the `seraph.dll` + `seraph.dll.lib` in
    that directory (use this for offline builds or an unreleased engine).
-2. Otherwise it queries the **latest GitHub release** of
-   [`Tree-D-Interactive-LLC/seraph`](https://github.com/Tree-D-Interactive-LLC/seraph),
-   downloads the self-contained candle-GPU FFI build
+2. Otherwise it downloads, from the GitHub release of
+   [`Tree-D-Interactive-LLC/seraph`](https://github.com/Tree-D-Interactive-LLC/seraph)
+   that the bindings come from, the self-contained candle-GPU FFI build
    (`*-ffi-windows-x86_64-gpu.zip`), and caches it under `target/` keyed by
    release tag. CUDA is loaded at runtime via the driver, with automatic CPU
    fallback — the build has zero native GPU dependencies.
 
 The safe Rust surface (`seraph` crate) is pulled as a **git dependency** from the
-same engine repo, so the binding layer can't drift out of sync with the engine.
+same engine repo, unpinned: its default branch carries the latest release.
+`Cargo.lock` records the commit a build uses, and `build.rs` fetches the DLL of
+the release the lock names, so the bindings and the engine always come from the
+same release. To move to a newer engine release:
+
+```powershell
+cargo update -p seraph
+cargo build --release
+```
+
+To hold a release instead, add `tag = "vX.Y.Z"` to the `seraph` line in
+`Cargo.toml`; the DLL follows the tag.
 
 > **Linking note:** if the build fails with a `link.exe` error, Git's
 > `C:\Program Files\Git\usr\bin\link.exe` is shadowing the MSVC linker — build
