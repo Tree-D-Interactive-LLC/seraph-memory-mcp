@@ -22,7 +22,10 @@ use rmcp::{
 };
 use serde_json::Value;
 
-use store::{parse_magnitude, parse_profile, BatchItem, Engine, RecallQuery};
+use store::{
+    parse_magnitude, parse_profile, parse_tau, BatchItem, Engine, HistoryQuery, RecallQuery, RecentBy,
+    TauArg, WarpPoint,
+};
 
 const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -132,6 +135,19 @@ fn metadata_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// Schema for `tau`: a number or a level name. Typed for the same reason as
+/// `metadata` — a typeless property reaches the server as a string.
+fn tau_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["number", "string", "null"],
+        "description": "Minimum score of a returned memory: a number 0.0-1.0, or a level of this \
+            store's own background similarity (how alike unrelated memories are) — \"loose\" \
+            (p75, the default), \"background\" (p95) or \"strict\" (p99). Levels move with the \
+            store as it grows. Raising it trims the list; it never hides a better match. An empty \
+            result means nothing in memory stands out for the query."
+    })
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RememberReq {
     #[schemars(description = "Text content to commit to memory.")]
@@ -181,8 +197,11 @@ pub struct RecallReq {
     pub query: String,
     #[schemars(description = "Max results (default 10).")]
     pub top_k: Option<u32>,
-    #[schemars(description = "Similarity threshold 0.0-1.0 (default 0.5).")]
-    pub tau: Option<f32>,
+    #[schemars(schema_with = "tau_schema")]
+    pub tau: Option<Value>,
+    #[schemars(description = "Added to the resolved threshold (default 0): -0.05 widens a vague \
+        query, +0.05 keeps only close matches.")]
+    pub tau_offset: Option<f32>,
     #[schemars(description = "Include soft-forgotten (superseded) frames in results (default false). \
         Off keeps recall clean; on is for audit — retrieving what was superseded.")]
     pub include_superseded: Option<bool>,
@@ -248,6 +267,81 @@ pub struct StrandReq {
     #[schemars(description = "Similarity floor for each step (omit to stop at the frame's own \
         background similarity).")]
     pub tau: Option<f32>,
+    #[schemars(description = "Text to steer the walk toward: of the strands, follow the one about \
+        this (e.g. \"licensing\" for why a decision was made as far as licensing goes). A step may \
+        not move against it.")]
+    pub toward: Option<String>,
+    #[schemars(description = "Strength of `toward`: a float or a named level (action_floor, \
+        routing, sub_saturation, saturation). Default sub_saturation.")]
+    pub magnitude: Option<Value>,
+    #[schemars(description = "Read the record as it stood at this time: frames written later are \
+        not steps. Same formats as recall's `after`.")]
+    pub as_of: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HistoryReq {
+    #[schemars(description = "The topic whose history to read.")]
+    pub query: String,
+    #[schemars(description = "Frames to return (default 10).")]
+    pub top_k: Option<u32>,
+    #[schemars(description = "How many of the topic's best search hits choose the trees the walk \
+        reads (default 3). More anchors read a broader history.")]
+    pub anchors: Option<u32>,
+    #[schemars(description = "Text to steer toward: which strand of the history to read.")]
+    pub toward: Option<String>,
+    #[schemars(description = "Strength of `toward`: a float or a named level. Default sub_saturation.")]
+    pub magnitude: Option<Value>,
+    #[schemars(description = "Only frames written at or after this time. Same formats as recall.")]
+    pub after: Option<String>,
+    #[schemars(description = "Only frames written at or before this time; the walk reads the record \
+        as it stood then.")]
+    pub before: Option<String>,
+    #[schemars(description = "Only frames whose content happened at or after this time.")]
+    pub occurred_after: Option<String>,
+    #[schemars(description = "Only frames whose content happened at or before this time.")]
+    pub occurred_before: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LedToReq {
+    #[schemars(description = "The earlier idea: text, or a frame ID.")]
+    pub from: String,
+    #[schemars(description = "The later idea: text, or a frame ID.")]
+    pub to: String,
+    #[schemars(description = "Read the record as it stood at this time. Same formats as recall's `after`.")]
+    pub as_of: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ConnectionsReq {
+    #[schemars(description = "One end: text (resolved to its best-matching memory), or a frame ID.")]
+    pub from: String,
+    #[schemars(description = "The other end: text, or a frame ID.")]
+    pub to: String,
+    #[schemars(description = "Most routes to return (default 4).")]
+    pub max_routes: Option<u32>,
+    #[schemars(description = "Only routes that run forward in the order memories were written, \
+        from the earlier end to the later (default false).")]
+    pub forward: Option<bool>,
+    #[schemars(description = "Read the record as it stood at this time. Same formats as recall's `after`.")]
+    pub as_of: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RecentReq {
+    #[schemars(description = "Only memories since this time (\"24h\", \"7d\", a date, an RFC 3339 \
+        timestamp); the result then says how many there are in all. Omit for the latest `limit`.")]
+    pub since: Option<String>,
+    #[schemars(description = "Most memories to return (default 20).")]
+    pub limit: Option<u32>,
+    #[schemars(description = "\"written\" (default): by when memories were written — what was \
+        learned lately. \"occurred\": by when their content happened. A store migrated from an \
+        older format counts every earlier memory as written at the migration; read those by \
+        \"occurred\".")]
+    pub by: Option<String>,
+    #[schemars(description = "Include soft-forgotten (superseded) memories (default false).")]
+    pub include_superseded: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -273,8 +367,10 @@ pub struct RecallWarpReq {
     pub bound_k: Option<f32>,
     #[schemars(description = "Max results (default 10).")]
     pub top_k: Option<u32>,
-    #[schemars(description = "Similarity threshold (default 0.5).")]
-    pub tau: Option<f32>,
+    #[schemars(schema_with = "tau_schema")]
+    pub tau: Option<Value>,
+    #[schemars(description = "Added to the resolved threshold (default 0).")]
+    pub tau_offset: Option<f32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -377,6 +473,29 @@ fn to_points(v: Option<Vec<WarpPointReq>>) -> Result<Vec<store::WarpPoint>, McpE
 
 fn to_profile(s: Option<&str>) -> Result<seraph::WarpProfile, McpError> {
     parse_profile(s).map_err(|e| McpError::invalid_params(e.to_string(), None))
+}
+
+fn to_tau(tau: Option<&Value>, offset: Option<f32>) -> Result<TauArg, McpError> {
+    let level = parse_tau(tau).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+    Ok(TauArg { level, offset: offset.unwrap_or(0.0) })
+}
+
+/// A `toward` steer as a warp point, at `sub_saturation` unless a magnitude is given.
+fn to_toward(text: Option<String>, magnitude: Option<&Value>) -> Result<Option<WarpPoint>, McpError> {
+    let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Ok(None) };
+    let magnitude = match magnitude {
+        None | Some(Value::Null) => seraph::Magnitude::Named("sub_saturation".into()),
+        m => parse_magnitude(m).map_err(|e| McpError::invalid_params(e.to_string(), None))?,
+    };
+    Ok(Some(WarpPoint { text, magnitude }))
+}
+
+fn parse_recent_by(s: Option<&str>) -> Result<RecentBy, String> {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("written") | Some("write") => Ok(RecentBy::Written),
+        Some("occurred") | Some("happened") | Some("event") => Ok(RecentBy::Occurred),
+        Some(other) => Err(format!("unknown by '{other}' — use written or occurred")),
+    }
 }
 
 fn ok_json(v: Value) -> Result<CallToolResult, McpError> {
@@ -484,7 +603,7 @@ impl SeraphMemory {
         carries it.")]
     async fn recall(&self, Parameters(r): Parameters<RecallReq>) -> Result<CallToolResult, McpError> {
         let top_k = r.top_k.unwrap_or(10) as usize;
-        let tau = r.tau.unwrap_or(0.5);
+        let tau = to_tau(r.tau.as_ref(), r.tau_offset)?;
         let include_superseded = r.include_superseded.unwrap_or(false);
         let order = parse_order(r.order.as_deref())
             .map_err(|e| McpError::invalid_params(e, None))?;
@@ -576,17 +695,82 @@ impl SeraphMemory {
         self.run(move |e| e.lineage(&r.frame_id)).await
     }
 
-    #[tool(description = "Provenance: what a frame was built on. Follows the frames it connected to \
-        when it was written, back through earlier frames, and returns the strand with coherence \
-        metrics. Unlike lineage (the parent tree), this follows similarity links too.")]
+    #[tool(description = "Provenance: what a frame was built on — why a conclusion was reached. \
+        Follows the frames it connected to when it was written, back through earlier frames, and \
+        returns the strand (each frame with its snippet and times) with coherence metrics. Unlike \
+        lineage (the parent tree), this follows similarity links too. `toward` steers which strand \
+        is followed; `as_of` reads the record as it stood then.")]
     async fn provenance(&self, Parameters(r): Parameters<StrandReq>) -> Result<CallToolResult, McpError> {
-        self.run(move |e| e.strand(&r.frame_id, false, r.tau)).await
+        let toward = to_toward(r.toward, r.magnitude.as_ref())?;
+        let as_of = opt_time(r.as_of.as_deref())?;
+        self.run(move |e| e.strand(&r.frame_id, false, r.tau, toward.as_ref(), as_of)).await
     }
 
-    #[tool(description = "Influence: what was later built on a frame. Follows the frames written \
-        after it that connected to it, forward in time. The counterpart of provenance.")]
+    #[tool(description = "Influence: what was later built on a frame — what a finding went on to \
+        shape. Follows the frames written after it that connected to it, forward in time. The \
+        counterpart of provenance; takes the same `toward` and `as_of`.")]
     async fn influence(&self, Parameters(r): Parameters<StrandReq>) -> Result<CallToolResult, McpError> {
-        self.run(move |e| e.strand(&r.frame_id, true, r.tau)).await
+        let toward = to_toward(r.toward, r.magnitude.as_ref())?;
+        let as_of = opt_time(r.as_of.as_deref())?;
+        self.run(move |e| e.strand(&r.frame_id, true, r.tau, toward.as_ref(), as_of)).await
+    }
+
+    // ---- time reads ----
+    #[tool(description = "The backstory of a topic, in order: what memory holds about it, oldest \
+        first (by when the content happened, else when it was written). The topic's best search \
+        hits choose the trees a walk reads, so this returns the arc that led to where things \
+        stand rather than a relevance-ranked list. Use it to catch up on a topic before working \
+        on it. `toward` steers which strand of the history is read; time windows work as in recall.")]
+    async fn history(&self, Parameters(r): Parameters<HistoryReq>) -> Result<CallToolResult, McpError> {
+        let q = HistoryQuery {
+            query: r.query,
+            top_k: r.top_k.unwrap_or(10).max(1) as usize,
+            anchors: r.anchors.unwrap_or(3).max(1) as usize,
+            toward: to_toward(r.toward, r.magnitude.as_ref())?,
+            written: seraph::TimeWindow {
+                after_us: opt_time(r.after.as_deref())?,
+                before_us: opt_time(r.before.as_deref())?,
+            },
+            occurred: seraph::TimeWindow {
+                after_us: opt_time(r.occurred_after.as_deref())?,
+                before_us: opt_time(r.occurred_before.as_deref())?,
+            },
+        };
+        self.run(move |e| e.history(q)).await
+    }
+
+    #[tool(description = "What memory has gained lately, with no query: the newest memories, newest \
+        first, each with its snippet and times. `since` limits it to memories since a time and \
+        reports how many there are in all; `by=\"occurred\"` reads by when content happened instead \
+        of when it was written. Use it at the start of a session to see what other sessions have \
+        learned.")]
+    async fn recent(&self, Parameters(r): Parameters<RecentReq>) -> Result<CallToolResult, McpError> {
+        let since = opt_time(r.since.as_deref())?;
+        let limit = r.limit.unwrap_or(20).max(1) as usize;
+        let by = parse_recent_by(r.by.as_deref()).map_err(|e| McpError::invalid_params(e, None))?;
+        let include_superseded = r.include_superseded.unwrap_or(false);
+        self.run(move |e| e.recent(since, limit, by, include_superseded)).await
+    }
+
+    #[tool(description = "How A led to B: a route forward in time, each step a memory written after \
+        the one before and connected to it when it was written. Use it to trace how a decision or \
+        finding came about from an earlier one. Each end is text (the memories that best fit it) \
+        or a frame ID. reached=false means the record holds no forward route. Time here is the \
+        order memories were written, not when their content happened.")]
+    async fn led_to(&self, Parameters(r): Parameters<LedToReq>) -> Result<CallToolResult, McpError> {
+        let as_of = opt_time(r.as_of.as_deref())?;
+        self.run(move |e| e.led_to(&r.from, &r.to, as_of)).await
+    }
+
+    #[tool(description = "The distinct ways two things relate: up to max_routes routes between them \
+        that share no intermediate memory, shortest first, each with its bridge — the memory \
+        closest to both ends. Each end is text (resolved to its best-matching memory) or a frame \
+        ID. forward=true keeps only routes that run forward in the order memories were written.")]
+    async fn connections(&self, Parameters(r): Parameters<ConnectionsReq>) -> Result<CallToolResult, McpError> {
+        let as_of = opt_time(r.as_of.as_deref())?;
+        let max_routes = r.max_routes.unwrap_or(4).max(1) as usize;
+        let forward = r.forward.unwrap_or(false);
+        self.run(move |e| e.connections(&r.from, &r.to, max_routes, forward, as_of)).await
     }
 
     // The forward counterpart to `lineage`: it descends the same ingestion tree from the seed's region.
@@ -612,7 +796,7 @@ impl SeraphMemory {
         let profile = to_profile(r.profile.as_deref())?;
         let bound_k = r.bound_k.unwrap_or(1.5);
         let top_k = r.top_k.unwrap_or(10) as usize;
-        let tau = r.tau.unwrap_or(0.5);
+        let tau = to_tau(r.tau.as_ref(), r.tau_offset)?;
         let query = r.query;
         self.run(move |e| e.recall_with_warp(&query, &targets, &suppress, profile, bound_k, top_k, tau))
             .await
@@ -751,7 +935,12 @@ impl ServerHandler for SeraphMemory {
              frame was built on and what was built on it; `lifecycle` for a frame's history. \
              TIME: `remember` takes occurred_at for content about another time; `recall` scopes \
              by write time (after/before) or by when content happened (occurred_after/\
-             occurred_before). WARP: named magnitudes resolve against the store's own \
+             occurred_before). `recent` lists what memory gained lately with no query — use it \
+             to catch up at the start of a session; `history` reads a topic's backstory oldest \
+             first; `led_to` traces how one idea led to a later one; `connections` lists the \
+             distinct ways two things relate, each with its bridge. THRESHOLDS: tau defaults to \
+             the store's own loose level, so an empty recall means nothing in memory stands out; \
+             tau_offset shifts it. WARP: named magnitudes resolve against the store's own \
              calibration. Use `routing` magnitude for gentle steering, `saturation` only for \
              cross-domain bridging; keep profile=bounded.",
             self.store_path
@@ -1034,8 +1223,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_order, parse_time_us};
+    use super::{parse_order, parse_recent_by, parse_time_us};
+    use crate::store::{parse_tau, RecentBy, TauLevel};
     use seraph::TemporalOrder;
+    use serde_json::json;
 
     fn now_us() -> i64 {
         chrono::Utc::now().timestamp_micros()
@@ -1093,5 +1284,25 @@ mod tests {
         assert_eq!(parse_order(Some(" newest ")).unwrap(), TemporalOrder::MostRecent);
         assert_eq!(parse_order(Some("oldest")).unwrap(), TemporalOrder::Oldest);
         assert!(parse_order(Some("sideways")).is_err());
+    }
+
+    #[test]
+    fn tau_reads_numbers_and_levels_and_defaults_to_loose() {
+        assert_eq!(parse_tau(None).unwrap(), TauLevel::Loose);
+        assert_eq!(parse_tau(Some(&json!(null))).unwrap(), TauLevel::Loose);
+        assert_eq!(parse_tau(Some(&json!(0.6))).unwrap(), TauLevel::Value(0.6));
+        // A stringified number, as a client facing a loose schema may send it.
+        assert_eq!(parse_tau(Some(&json!("0.6"))).unwrap(), TauLevel::Value(0.6));
+        assert_eq!(parse_tau(Some(&json!("Strict"))).unwrap(), TauLevel::Strict);
+        assert_eq!(parse_tau(Some(&json!("p95"))).unwrap(), TauLevel::Background);
+        assert!(parse_tau(Some(&json!("tight"))).is_err());
+        assert!(parse_tau(Some(&json!([0.5]))).is_err());
+    }
+
+    #[test]
+    fn recent_by_parses_and_rejects_junk() {
+        assert_eq!(parse_recent_by(None).unwrap(), RecentBy::Written);
+        assert_eq!(parse_recent_by(Some("OCCURRED")).unwrap(), RecentBy::Occurred);
+        assert!(parse_recent_by(Some("sideways")).is_err());
     }
 }

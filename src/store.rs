@@ -16,9 +16,10 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 
 use seraph::{
-    ChainResult, DoorCause, Encoder, Endpoint, Magnitude, NeighborhoodOptions, PutItem, PutOptions,
-    Retirement, RouteOptions, SearchOptions, Store, StoreConfig, StrandOptions, Tau, TemporalOrder,
-    TimeFilter, TimeWindow, WarpInput, WarpProfile, WarpSpec,
+    ChainResult, DoorCause, Encoder, Endpoint, EndpointFit, HistoryOptions, Magnitude,
+    NeighborhoodOptions, PutItem, PutOptions, Retirement, RouteOptions, SearchOptions, Store,
+    StoreConfig, StrandOptions, Tau, TauSpec, TemporalOrder, TimeFilter, TimeWindow, WarpInput,
+    WarpProfile, WarpSpec,
 };
 
 pub struct Engine {
@@ -44,6 +45,36 @@ pub struct BatchItem {
     pub occurred_at: Option<i64>,
 }
 
+/// A similarity threshold as a tool supplies it: a number, or a level of the
+/// store's own background similarity (how alike unrelated frames are), which
+/// moves with the corpus as it densifies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TauLevel {
+    Value(f32),
+    /// The background's 75th percentile: the default.
+    Loose,
+    /// Its 95th percentile.
+    Background,
+    /// Its 99th percentile.
+    Strict,
+}
+
+/// A threshold and the offset added to it once it is resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TauArg {
+    pub level: TauLevel,
+    pub offset: f32,
+}
+
+/// Which time `recent` reads frames by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentBy {
+    /// When they were written.
+    Written,
+    /// When their content happened (their write time when they give none).
+    Occurred,
+}
+
 // --------------------------------------------------------------------------- //
 // small helpers
 // --------------------------------------------------------------------------- //
@@ -60,6 +91,14 @@ fn parse_opt(label: &str, s: Option<String>) -> Result<Value> {
         None => Err(anyhow!("{label} returned no data")),
     }
 }
+
+/// The threshold a search walks at when the caller's is higher. The engine's
+/// tau gates the walk as well as the hits: a branch whose door scores below it
+/// is never entered, so raising it can lose the best match (measured on the
+/// memory store: a query whose best frame scores 0.634 returns nothing at tau
+/// 0.62). Reads walk at this gate at most and filter their hits at the
+/// caller's threshold, so a higher threshold trims the list instead.
+const WALK_TAU: f32 = 0.5;
 
 /// Values for the named warp levels, used only when the store has no warp
 /// calibration of its own to resolve a name against.
@@ -86,6 +125,28 @@ pub fn parse_magnitude(v: Option<&Value>) -> Result<Magnitude> {
             )),
         },
         Some(other) => Err(anyhow!("magnitude must be a number or a level name, got {other}")),
+    }
+}
+
+/// Read a tool-supplied threshold: a number (or a numeric string), or a level
+/// name. Absent means the store's loose level.
+pub fn parse_tau(v: Option<&Value>) -> Result<TauLevel> {
+    match v {
+        None | Some(Value::Null) => Ok(TauLevel::Loose),
+        Some(Value::Number(n)) => Ok(TauLevel::Value(n.as_f64().unwrap_or(0.5) as f32)),
+        Some(Value::String(s)) => {
+            let t = s.trim().to_ascii_lowercase();
+            if let Ok(x) = t.parse::<f32>() {
+                return Ok(TauLevel::Value(x));
+            }
+            match t.as_str() {
+                "" | "loose" | "p75" => Ok(TauLevel::Loose),
+                "background" | "auto" | "p95" => Ok(TauLevel::Background),
+                "strict" | "p99" => Ok(TauLevel::Strict),
+                _ => Err(anyhow!("unknown tau '{s}' — use a number 0.0-1.0 or one of loose, background, strict")),
+            }
+        }
+        Some(other) => Err(anyhow!("tau must be a number or a level name, got {other}")),
     }
 }
 
@@ -122,6 +183,22 @@ fn chain_value(c: ChainResult) -> Value {
             "stretch": if c.coherence.stretch.is_finite() { json!(round4(c.coherence.stretch)) } else { Value::Null },
         },
     })
+}
+
+/// One end of a time read as a tool gives it: an existing frame, or text that
+/// stands for the frames that fit it best.
+enum End {
+    Frame(String),
+    Text(Vec<f32>),
+}
+
+impl End {
+    fn endpoint(&self) -> Endpoint<'_> {
+        match self {
+            End::Frame(f) => Endpoint::Frame(f),
+            End::Text(e) => Endpoint::Query(e),
+        }
+    }
 }
 
 /// Metadata as the engine takes it: a JSON object. A JSON object sent as a
@@ -278,7 +355,7 @@ impl Engine {
 pub struct RecallQuery {
     pub query: String,
     pub top_k: usize,
-    pub tau: f32,
+    pub tau: TauArg,
     pub include_superseded: bool,
     pub order: TemporalOrder,
     /// On when frames were written (the engine's commit time).
@@ -303,6 +380,65 @@ impl Engine {
             s = s.chars().take(240).collect::<String>() + "…";
         }
         Some(s)
+    }
+
+    /// A threshold resolved against this store's background similarity, plus
+    /// its offset, held to 0..=1.
+    fn tau(&self, t: TauArg) -> f32 {
+        let base = match t.level {
+            TauLevel::Value(v) => v,
+            TauLevel::Loose => self.store.resolve_tau_spec(TauSpec::Loose),
+            TauLevel::Background => self.store.resolve_tau_spec(TauSpec::Auto),
+            TauLevel::Strict => self.store.resolve_tau_spec(TauSpec::Strict),
+        };
+        (base + t.offset).clamp(0.0, 1.0)
+    }
+
+    /// A frame as a time read shows it: its snippet, when it was written, and
+    /// when its content happened where it records that.
+    fn brief(&self, frame_id: &str) -> Value {
+        let mut v = json!({ "frame_id": frame_id, "snippet": self.content_snippet(frame_id) });
+        if let Ok(Some(l)) = self.store.lifecycle(frame_id) {
+            let obj = v.as_object_mut().expect("object");
+            if let Some(t) = iso(l.committed.committed_at) {
+                obj.insert("timestamp".into(), json!(t));
+            }
+            if let Some(t) = l.occurred_at.and_then(iso) {
+                obj.insert("occurred_at".into(), json!(t));
+            }
+        }
+        v
+    }
+
+    /// A route with each of its frames shown in place of their IDs.
+    fn route_value(&self, c: ChainResult) -> Value {
+        let frames: Vec<Value> = c.frame_ids.iter().map(|f| self.brief(f)).collect();
+        let mut v = chain_value(c);
+        let obj = v.as_object_mut().expect("object");
+        obj.remove("frame_ids");
+        obj.insert("frames".into(), json!(frames));
+        v
+    }
+
+    /// A frame's place in the record: the order frames were written in.
+    fn position(&self, frame_id: &str) -> Option<u32> {
+        self.store.lifecycle(frame_id).ok().flatten().map(|l| l.committed.position)
+    }
+
+    /// One end of a time read: an existing frame's ID as given, else text.
+    fn end(&mut self, s: &str) -> Result<End> {
+        let t = s.trim();
+        if self.store.borrow_frame(t).is_some() {
+            return Ok(End::Frame(t.to_string()));
+        }
+        Ok(End::Text(self.encode(t)?))
+    }
+
+    /// The warp a `toward` point compiles to, if one is given.
+    fn toward(&mut self, toward: Option<&WarpPoint>) -> Result<Option<seraph::Warp>> {
+        let Some(p) = toward else { return Ok(None) };
+        let spec = self.warp_spec(std::slice::from_ref(p), &[], WarpProfile::Bounded, 1.5)?;
+        Ok(Some(self.compile(spec)?.1))
     }
 
     /// A hit with its snippet. Its write time is included when `with_time` is
@@ -337,16 +473,18 @@ impl Engine {
         let with_time = q.order != TemporalOrder::Relevance
             || q.written != TimeWindow::default()
             || q.occurred != TimeWindow::default();
+        let tau = self.tau(q.tau);
         let options = SearchOptions {
             top_k: q.top_k,
-            tau: Tau::Value(q.tau),
+            tau: Tau::Value(tau.min(WALK_TAU)),
             include_superseded: q.include_superseded,
             time: TimeFilter { committed: q.written, occurred: q.occurred, ..Default::default() },
             order: q.order,
             ..Default::default()
         };
         let hits = self.store.search_with(&emb, &options)?.hits;
-        let results: Vec<Value> = hits.into_iter().map(|h| self.hit_value(h, with_time)).collect();
+        let results: Vec<Value> =
+            hits.into_iter().filter(|h| h.score >= tau).map(|h| self.hit_value(h, with_time)).collect();
         Ok(json!(results))
     }
 
@@ -464,18 +602,244 @@ impl Engine {
         parse_opt("evolution", self.store.evolution_json(seed_frame_id))
     }
 
+}
+
+// --------------------------------------------------------------------------- //
+// time reads: strands, history, routes forward, recent
+// --------------------------------------------------------------------------- //
+
+/// What `history` asks: a topic, how much of its past, and from which frames.
+pub struct HistoryQuery {
+    pub query: String,
+    pub top_k: usize,
+    pub anchors: usize,
+    pub toward: Option<WarpPoint>,
+    pub written: TimeWindow,
+    pub occurred: TimeWindow,
+}
+
+impl Engine {
     /// What a frame was built on (`forward = false`) or what was later built on
     /// it (`forward = true`): a strand through the frames it attached to when
     /// it was written, or that attached to it. `tau = None` stops at the
-    /// frame's own background.
-    pub fn strand(&self, frame_id: &str, forward: bool, tau: Option<f32>) -> Result<Value> {
-        let options = StrandOptions { tau: tau.map_or(Tau::QueryBackground, Tau::Value), ..Default::default() };
+    /// frame's own background; `toward` steers which strand is followed;
+    /// `as_of` reads the record as it stood then.
+    pub fn strand(
+        &mut self,
+        frame_id: &str,
+        forward: bool,
+        tau: Option<f32>,
+        toward: Option<&WarpPoint>,
+        as_of: Option<i64>,
+    ) -> Result<Value> {
+        let warp = self.toward(toward)?;
+        let options = StrandOptions {
+            tau: tau.map_or(Tau::QueryBackground, Tau::Value),
+            warp: warp.as_ref(),
+            as_of,
+            ..Default::default()
+        };
         let c = if forward {
             self.store.influence_with(frame_id, &options)?
         } else {
             self.store.provenance_with(frame_id, &options)?
         };
-        Ok(chain_value(c))
+        Ok(self.route_value(c))
+    }
+
+    /// How the store came to hold what a query finds: the query's top
+    /// `anchors` hits choose the trees, and the best `top_k` frames along them
+    /// come back oldest first (by when their content happened, else when they
+    /// were written).
+    pub fn history(&mut self, q: HistoryQuery) -> Result<Value> {
+        let emb = self.encode(&q.query)?;
+        let warp = self.toward(q.toward.as_ref())?;
+        let options = HistoryOptions {
+            top_k: q.top_k,
+            tau: Tau::Value(WALK_TAU),
+            anchors: q.anchors,
+            warp: warp.as_ref(),
+            time: TimeFilter { committed: q.written, occurred: q.occurred, ..Default::default() },
+        };
+        let h = self.store.history_with(&emb, &options)?;
+        let hits: Vec<Value> = h
+            .hits
+            .into_iter()
+            .map(|x| {
+                let mut v = json!({
+                    "frame_id": x.frame_id,
+                    "score": round4(x.score),
+                    "depth": x.depth,
+                    "timestamp": iso(x.timestamp),
+                    "snippet": self.content_snippet(&x.frame_id),
+                });
+                if let Some(t) = x.occurred_at.and_then(iso) {
+                    v["occurred_at"] = json!(t);
+                }
+                v
+            })
+            .collect();
+        Ok(json!({ "anchors": h.anchors, "hits": hits }))
+    }
+
+    /// How `from` led to `to`: the route forward in record order between them.
+    /// Each end is a frame ID or text; text stands for its top 10 hits, and
+    /// the best-fitting earlier/later pair a route joins is used.
+    pub fn led_to(&mut self, from: &str, to: &str, as_of: Option<i64>) -> Result<Value> {
+        let (a, b) = (self.end(from)?, self.end(to)?);
+        let options = RouteOptions {
+            forward: true,
+            fit: Some(EndpointFit { top_k: 10, tau: WALK_TAU }),
+            as_of,
+            ..Default::default()
+        };
+        let c = self.store.chain_with(a.endpoint(), b.endpoint(), &options)?;
+        let reached = c.reached;
+        let mut v = self.route_value(c);
+        if let (false, End::Frame(fa), End::Frame(fb)) = (reached, &a, &b) {
+            if self.position(fa) > self.position(fb) {
+                v["note"] = json!("`from` was written after `to`; a route forward in time starts at the earlier frame, so swap them");
+            }
+        }
+        Ok(v)
+    }
+
+    /// The frame a route end stands for: an existing frame's ID as given, or
+    /// the best hit for text in the record as it stood at `as_of`.
+    fn resolve_frame(&mut self, s: &str, as_of: Option<i64>) -> Result<String> {
+        match self.end(s)? {
+            End::Frame(f) => Ok(f),
+            End::Text(emb) => {
+                let options = SearchOptions {
+                    top_k: 1,
+                    tau: Tau::Value(WALK_TAU),
+                    time: TimeFilter { committed: TimeWindow { after_us: None, before_us: as_of }, ..Default::default() },
+                    ..Default::default()
+                };
+                let hit = self.store.search_with(&emb, &options)?.hits.into_iter().next();
+                hit.map(|h| h.frame_id)
+                    .ok_or_else(|| anyhow!("nothing in memory fits '{s}'; rephrase it or give a frame ID"))
+            }
+        }
+    }
+
+    /// The distinct ways two frames connect: up to `max_routes` routes whose
+    /// interiors share no frame, shortest first, each with its bridge (the
+    /// interior frame closest to both ends). With `forward`, only routes that
+    /// run forward in record order, from the earlier end to the later.
+    pub fn connections(
+        &mut self,
+        a: &str,
+        b: &str,
+        max_routes: usize,
+        forward: bool,
+        as_of: Option<i64>,
+    ) -> Result<Value> {
+        let mut from = self.resolve_frame(a, as_of)?;
+        let mut to = self.resolve_frame(b, as_of)?;
+        if from == to {
+            return Ok(json!({
+                "from": self.brief(&from),
+                "to": self.brief(&to),
+                "routes": [],
+                "note": "both ends resolve to the same frame; give more distinct ends or frame IDs",
+            }));
+        }
+        let swapped = forward && self.position(&from) > self.position(&to);
+        if swapped {
+            std::mem::swap(&mut from, &mut to);
+        }
+        let options = RouteOptions { forward, as_of, ..Default::default() };
+        let conns = self.store.connections_with(Endpoint::Frame(&from), Endpoint::Frame(&to), &options, max_routes)?;
+        let routes: Vec<Value> = conns
+            .into_iter()
+            .map(|c| {
+                let ids = &c.chain.frame_ids;
+                let via: Vec<Value> = ids.iter().skip(1).take(ids.len().saturating_sub(2)).map(|f| self.brief(f)).collect();
+                let stretch = c.chain.coherence.stretch;
+                json!({
+                    "bridge": c.bridge,
+                    "via": via,
+                    "reached": c.chain.reached,
+                    "stretch": if stretch.is_finite() { json!(round4(stretch)) } else { Value::Null },
+                })
+            })
+            .collect();
+        let mut v = json!({ "from": self.brief(&from), "to": self.brief(&to), "forward": forward, "routes": routes });
+        if swapped {
+            v["swapped"] = json!(true);
+        }
+        Ok(v)
+    }
+
+    /// What the store has gained lately, newest first, with no query: the
+    /// latest `limit` frames, or those written (or, `by` occurred, that
+    /// happened) since `since`, with how many there are in all.
+    pub fn recent(&self, since: Option<i64>, limit: usize, by: RecentBy, include_superseded: bool) -> Result<Value> {
+        // Genesis, redirect and system frames are the store's own records, not memories.
+        let shown = |status: u8| match status {
+            0 | 5 | 6 => false,
+            4 => include_superseded,
+            _ => true,
+        };
+        let ids = self.store.frame_ids();
+        let mut picked: Vec<(i64, &String)> = Vec::new();
+        match by {
+            RecentBy::Written => {
+                // The record is in write order, so read it back from the end
+                // and stop at the first frame written before `since`.
+                for id in ids.iter().rev() {
+                    let Some(f) = self.store.borrow_frame(id) else { continue };
+                    let (status, t) = (f.status(), f.timestamp());
+                    drop(f);
+                    if since.is_some_and(|s| t < s) {
+                        break;
+                    }
+                    if shown(status) {
+                        picked.push((t, id));
+                        if since.is_none() && picked.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            RecentBy::Occurred => {
+                // Event time follows no order in the record: read every frame.
+                for id in &ids {
+                    let Some(status) = self.store.borrow_frame(id).map(|f| f.status()) else { continue };
+                    if !shown(status) {
+                        continue;
+                    }
+                    let Some(l) = self.store.lifecycle(id)? else { continue };
+                    let t = l.occurred_at.unwrap_or(l.committed.committed_at);
+                    if since.map_or(true, |s| t >= s) {
+                        picked.push((t, id));
+                    }
+                }
+                picked.sort_by(|x, y| y.0.cmp(&x.0));
+            }
+        }
+        let total = picked.len();
+        let frames: Vec<Value> = picked
+            .into_iter()
+            .take(limit)
+            .map(|(_, id)| {
+                let mut v = self.brief(id);
+                if self.store.borrow_frame(id).is_some_and(|f| f.status() == 4) {
+                    v["superseded"] = json!(true);
+                }
+                v
+            })
+            .collect();
+        let mut v = json!({
+            "by": match by { RecentBy::Written => "written", RecentBy::Occurred => "occurred" },
+            "frames": frames,
+        });
+        if let Some(s) = since {
+            v["since"] = json!(iso(s));
+            v["total"] = json!(total);
+        }
+        Ok(v)
     }
 }
 
@@ -523,14 +887,16 @@ impl Engine {
         profile: WarpProfile,
         bound_k: f32,
         top_k: usize,
-        tau: f32,
+        tau: TauArg,
     ) -> Result<Value> {
         let emb = self.encode(query)?;
         let spec = self.warp_spec(targets, suppress, profile, bound_k)?;
         let (_, warp) = self.compile(spec)?;
-        let options = SearchOptions { top_k, tau: Tau::Value(tau), warp: Some(&warp), ..Default::default() };
+        let tau = self.tau(tau);
+        let options = SearchOptions { top_k, tau: Tau::Value(tau.min(WALK_TAU)), warp: Some(&warp), ..Default::default() };
         let hits = self.store.search_with(&emb, &options)?.hits;
-        let results: Vec<Value> = hits.into_iter().map(|h| self.hit_value(h, false)).collect();
+        let results: Vec<Value> =
+            hits.into_iter().filter(|h| h.score >= tau).map(|h| self.hit_value(h, false)).collect();
         Ok(json!({ "profile": format!("{profile:?}").to_ascii_lowercase(), "results": results }))
     }
 

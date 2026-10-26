@@ -7,7 +7,9 @@ canonical [`seraph`](https://github.com/Tree-D-Interactive-LLC/seraph) safe
 wrapper crate. No Python runtime, no PyO3.
 
 One global store, the engine's own on-device encoder, and a curated set of
-substrate tools: *remember / recall*, reasoning **chains**, three-population
+substrate tools: *remember / recall*, reads through **time** (a topic's
+**history**, what is **recent**, how one idea **led to** another, the
+**connections** between two), reasoning **chains**, three-population
 **neighborhoods**, **contradiction** detection, **lineage**, **provenance** and
 **influence**, each frame's **lifecycle**, **warp** steering, declared **typed
 relations**, and diagnostics.
@@ -18,6 +20,7 @@ relations**, and diagnostics.
 |-------|-------|
 | Write | `remember`, `remember_batch`, `add_seed`, `promote_frame` |
 | Recall | `recall`, `get_frame`, `lifecycle`, `eigenframes_list` |
+| Time | `history`, `recent`, `led_to`, `connections` |
 | Chains | `chain`, `chain_to`, `chain_between` |
 | Context / provenance | `neighborhood`, `lineage`, `provenance`, `influence`, `evolution` |
 | Warp (steering) | `recall_with_warp`, `warp_chain_to`, `warp_chain_between`, `warp_seed_margin`, `warp_steerability`, `warp_calibration` |
@@ -28,6 +31,21 @@ relations**, and diagnostics.
 `saturation`) resolve against the store's own calibration, which the server
 refreshes on load when the corpus has moved; `warp_calibration` recalibrates now
 and shows the levels. Keep `profile=bounded`.
+
+### Threshold
+
+`recall`'s `tau` is the lowest score a returned memory may have. By default it
+is the store's own **loose** level: the 75th percentile of how alike unrelated
+memories are, so it moves with the corpus as it grows. Pass a number, or
+`background` (p95) or `strict` (p99), and shift any of them with `tau_offset`
+(`-0.05` to widen a vague query, `+0.05` to keep only close matches). An empty
+result means nothing in memory stands out for the query.
+
+The engine's threshold also decides which branches a search walks into, so a
+high one can lose the best match outright: a query whose best memory scores
+0.634 returns nothing at 0.62. The server therefore walks at 0.5 at most and
+applies the threshold to the hits, so raising it trims the list rather than
+hiding a better match. `recall_with_warp` takes the same `tau` and `tau_offset`.
 
 ### Time
 
@@ -65,6 +83,39 @@ its history.
 > to make `top_k` still won't appear. For more time depth, raise `top_k` — or use
 > `after` to scope the search to a window, which frees result slots that
 > higher-scoring older frames would otherwise occupy.
+
+### Reads through time
+
+Beyond recall, these tools read the record by when things were written and what
+was built on what. Each returns its memories with their snippet and both times.
+
+| Tool | Answers |
+|------|---------|
+| `history` | *Catch me up on X.* The memories about a topic, oldest first by when their content happened. The topic's best hits (`anchors`, default 3) choose the trees a walk reads, so this is the arc that led to where things stand, not a ranked list. |
+| `recent` | *What has memory gained lately?* No query: the newest memories, newest first; `since` scopes it and reports the total; `by="occurred"` reads by when content happened. |
+| `led_to` | *How did A lead to B?* A route forward in time, each step a memory written after the one before and connected to it when it was written. Each end is text or a frame ID. |
+| `connections` | *In what different ways does X relate to Y?* Up to `max_routes` routes that share no intermediate memory, each with its bridge: the memory closest to both ends. `forward=true` keeps routes that run forward in time. |
+| `provenance` / `influence` | *Why was this concluded? What did it go on to shape?* The strand a memory was built on, or that was built on it. |
+
+`history`, `provenance` and `influence` take `toward`: text that chooses which
+strand to follow ("why was this decided, as far as licensing goes"), at
+`sub_saturation` unless `magnitude` says otherwise. A step may not move against
+it, so a direction no strand runs in stops at the first memory. `provenance`,
+`influence`, `led_to` and `connections` take `as_of`, which reads the record as
+it stood at a time.
+
+"Forward in time" for `led_to`, `connections` and the strands is the order the
+store learned things, not the order they happened: a batch of old notes imported
+today follows everything written before it. `history` orders by when content
+happened.
+
+> **On a migrated store, write time starts at the migration.** Migration keeps
+> every memory's place in the record, so `led_to`, `connections` and the strands
+> read the whole history. But it stamps one write time on every memory that
+> predates it, so `as_of` and `after`/`before` see nothing earlier, and `recent`
+> counts all of them as written at the migration. Read those memories by when
+> they happened: `occurred_after`/`occurred_before`, `recent(by="occurred")`,
+> and `history`.
 
 ## Requirements
 
